@@ -16,7 +16,7 @@
         "by": null,
         "decision": "pending"
       },
-      "status": "in_progress",
+      "status": "validated",
       "tasks": {
         "FEAT-001-T01": {
           "depends_on": [],
@@ -62,12 +62,12 @@
           "updated_at": "2026-10-21T13:02:30Z"
         }
       },
-      "updated_at": "2026-10-21T13:02:30Z",
+      "updated_at": "2026-10-21T13:47:35Z",
       "validation": {
-        "at": null,
-        "command": null,
-        "commit": null,
-        "result": "pending"
+        "at": "2026-10-21T13:47:35Z",
+        "command": "uv run pytest -q",
+        "commit": "c2d633ab4f10572762ad7356ba74846f0598fa9c",
+        "result": "pass"
       }
     }
   },
@@ -81,9 +81,9 @@
       "id": "REQ-001",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
-      "status": "in_delivery",
+      "status": "validated",
       "title": "Agent 可用的终端会话 MCP Server（MVP）",
-      "updated_at": "2026-10-21T13:02:30Z"
+      "updated_at": "2026-10-21T13:47:35Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

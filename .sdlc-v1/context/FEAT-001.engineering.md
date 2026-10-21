@@ -574,9 +574,23 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form（command 为 `uv`�
 
 ## 验证记录（实际）
 
-- **状态**：尚未执行：实现完成后按本文测试策略执行。
-- **被测版本、环境、命令与结果**：`none`。
-- **覆盖与缺口**：尚未执行；US8/SC-002 须由主 Agent 在 validate 阶段以 Manus 实测。
+- **状态**：`PASS`（2026-10-21，主 Agent 执行与核对）。验证方式：`correctness`（单元 + 真实 stdio 集成测试）+ 真实客户端 E2E（Manus）。
+- **被测版本**：`c2d633ab4f10572762ad7356ba74846f0598fa9c`（实现提交 `0188a33` 之上仅有 `.sdlc-v1/state.json` 变化）。
+- **命令与结果**：
+  - 本机 macOS 26.4.1 arm64、CPython 3.12.13、mcp 2.3.0，2026-10-21T21:02:55+08:00：`UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp uv lock --locked --offline`（37 packages，exit 0）；`uv run --offline terminal-mcp --help`（exit 0）；`uv run --offline pytest -q` → **240 passed in 35.20s**（exit 0）；`uv run --offline pytest -q -s tests/integration/test_capacity.py` → 2 passed，`wait_latency_ms=15.096`，`rss_growth=1720320`（baseline 80,019,456 → peak 81,739,776），突发期间最大调用 4.870 ms。
+  - GitHub Actions run `39610078999`（push 到 `feat/FEAT-001-terminal-mcp-mvp`，headSha `c2d633a`，2026-10-21T13:40:40Z→13:42:11Z）：`uv sync --locked` + `uv run pytest -q`；ubuntu-latest **240 passed in 45.93s**，macos-latest **240 passed in 63.11s**，均 success。
+  - Manus E2E：创建 stdio 自定义连接器 `terminal-mcp`（uid `1d2aacd6-7c28-4355-afdb-4a20f83174e8`，命令 `bash -lc "... exec uvx --from git+https://github.com/arnow117/terminal-mcp@c2d633a… terminal-mcp"`）；主 Agent 先 `tools/list` 冒烟确认五个 Tool 发布。随后新建云端沙箱任务 `Kir4ooJTDyTA9AdtssSEUh`，只启用该连接器、只给自然语言指令（启动 `python3 -i`、计算 `6*7`、读取、终止），不提供任何 Tool 用法。该 Agent 仅读 `tools/list` 与参数 schema 后依次调用 `terminal_start(command="python3 -i", mode=pty, until=">>> ", wait_ms=5000)` → `terminal_write(text="6*7", keys=["Enter"], until=…)` → `terminal_read(cursor=143)` → `terminal_kill(signal=TERM, grace_ms=1000)`，输出 `42`，四次调用均无错误码、无重试，`dropped_bytes=0`，最终 `status=signaled`；沙箱为 Linux（Python 3.12.3），约 63 秒完成。
+
+| 验收条件 | 结果 | 证据或缺口 |
+|---|---|---|
+| SC-001：US1~US7 全部验收场景自动化覆盖并通过 | PASS | 本机与 CI 两平台 240 passed；场景映射见“测试策略与验收映射”及 T03/T04 实现记录（`test_mcp_stdio.py`、`test_lifecycle.py`、`test_policy_audit.py`、`test_restart.py`）。 |
+| US8 / SC-002：Manus 中 Agent 仅凭 Tool 描述完成交互流程且无参数错误重试 | PASS | Manus 任务 `Kir4ooJTDyTA9AdtssSEUh` 一次组合成功，0 错误、0 重试。 |
+| SC-003：等待中的读取 200 ms 内拿到新输出 | PASS | 本机实测 15.096 ms；CI 两平台严格断言通过。 |
+| SC-004：kill / 客户端断开后 2 秒内进程为 0 | PASS | `test_kill_reaps_whole_process_group`、`test_stdio_eof_reaps_all_groups` 等在三处运行均通过。 |
+| SC-005：50 MB 输出时 RSS 增长不超过 3 倍缓冲上限 | PASS | 本机 growth 1,720,320 B（上限 3,145,728 B），保留缓冲 ≤1 MiB；CI 两平台断言通过。 |
+| 边界情况 1~8 | PASS | 单元与集成测试覆盖，见测试策略映射；全部在全量套件中通过。 |
+
+- **覆盖与缺口**：Linux 证据来自 GitHub Actions ubuntu-latest 与 Manus 云端沙箱实际运行；Manus 实测为单次代表性流程，不代表长期多用户使用。连接器当前固定指向验证提交 `c2d633a`，发布后应改为 `main` 或 `v0.1.0` 标签（发布阶段处理）。未发现实现缺陷或环境阻塞残留；验证中遇到的仅是推送权限问题（gh 令牌缺 `workflow` scope、SSH agent 位于沙箱外），已通过用户加载 SSH 密钥后一次性提权推送解决，不影响被测实现。
 
 ## 评审记录（实际）
 
