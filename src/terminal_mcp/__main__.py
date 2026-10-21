@@ -1,20 +1,24 @@
-"""Console entry point; stdio server wiring is implemented in the MCP task."""
+"""Console entry point for the local MCP stdio server."""
 
+import asyncio
 import sys
 
 from .config import load_config, parse_cli
 from .contracts import ToolError
+from .server import run_stdio
 
 
 def main() -> int:
     args = parse_cli()
     try:
-        load_config(**vars(args))
+        config = load_config(**vars(args))
+        asyncio.run(run_stdio(config))
     except ToolError as exc:
         print(f"{exc.code}: {exc.message} {exc.hint}", file=sys.stderr)
         return 2
-    print("The stdio server is not implemented yet; use --help to inspect configuration options.", file=sys.stderr)
-    return 1
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 if __name__ == "__main__":
