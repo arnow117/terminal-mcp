@@ -16,53 +16,53 @@
         "by": null,
         "decision": "pending"
       },
-      "status": "planned",
+      "status": "in_progress",
       "tasks": {
         "FEAT-001-T01": {
           "depends_on": [],
           "id": "FEAT-001-T01",
-          "status": "todo",
+          "status": "done",
           "title": "建立受测的包契约、配置和纯组件",
-          "updated_at": "2026-10-21T11:39:23Z"
+          "updated_at": "2026-10-21T12:36:06Z"
         },
         "FEAT-001-T02": {
           "depends_on": [
             "FEAT-001-T01"
           ],
           "id": "FEAT-001-T02",
-          "status": "todo",
+          "status": "done",
           "title": "实现可清理的 PTY 与 pipe 会话管理器",
-          "updated_at": "2026-10-21T11:39:23Z"
+          "updated_at": "2026-10-21T12:36:23Z"
         },
         "FEAT-001-T03": {
           "depends_on": [
             "FEAT-001-T02"
           ],
           "id": "FEAT-001-T03",
-          "status": "todo",
+          "status": "done",
           "title": "发布五个 stdio Tool 并覆盖会话、游标、交互和隔离",
-          "updated_at": "2026-10-21T11:39:23Z"
+          "updated_at": "2026-10-21T12:36:23Z"
         },
         "FEAT-001-T04": {
           "depends_on": [
             "FEAT-001-T03"
           ],
           "id": "FEAT-001-T04",
-          "status": "todo",
+          "status": "done",
           "title": "完成连接关闭、重启清扫、安全审计和性能边界",
-          "updated_at": "2026-10-21T11:39:23Z"
+          "updated_at": "2026-10-21T12:56:47Z"
         },
         "FEAT-001-T05": {
           "depends_on": [
             "FEAT-001-T04"
           ],
           "id": "FEAT-001-T05",
-          "status": "todo",
+          "status": "done",
           "title": "交付 README 全局 usage 入口和可复现本地验证",
-          "updated_at": "2026-10-21T11:39:23Z"
+          "updated_at": "2026-10-21T13:02:30Z"
         }
       },
-      "updated_at": "2026-10-21T11:39:23Z",
+      "updated_at": "2026-10-21T13:02:30Z",
       "validation": {
         "at": null,
         "command": null,
@@ -83,7 +83,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
       "status": "in_delivery",
       "title": "Agent 可用的终端会话 MCP Server（MVP）",
-      "updated_at": "2026-10-21T11:39:22Z"
+      "updated_at": "2026-10-21T13:02:30Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
