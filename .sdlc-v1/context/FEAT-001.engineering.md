@@ -553,13 +553,13 @@ README 将明确参数所有者：Tool 参数以 `tools/list` 的 schema/descrip
 
 ```text
 # 已克隆仓库
-uv run --directory <repo> terminal-mcp
+uv run --directory <repo> terminal-mcp --allowed-root <dir>
 
 # 发布后从公开 Git 仓库运行
-uvx --from git+https://github.com/<owner>/<repo> terminal-mcp
+uvx --from git+https://github.com/arnow117/terminal-mcp terminal-mcp --allowed-root <dir>
 ```
 
-Manus 使用本机 MCP/自定义 MCP 的上述 command form；Claude Code 使用 `claude mcp add --transport stdio terminal-mcp -- uv run --directory <repo> terminal-mcp`；Codex 使用 `codex mcp add terminal-mcp -- uv run --directory <repo> terminal-mcp`。`<owner>/<repo>` 是 DEC-010 后由主 Agent 创建公共仓库时替换的发布值，规划阶段不猜测账号或创建仓库。README 会说明这些客户端均以当前用户启动 server，注册 command 的 cwd/config 决定 `allowed_roots` 默认值。
+Manus 使用本机 MCP/自定义 MCP 的上述 command form（command 为 `uv`，其余为 args）；Claude Code 使用 `claude mcp add terminal-mcp -- uv run --directory <repo> terminal-mcp --allowed-root <dir>`；Codex 使用 `codex mcp add terminal-mcp -- uv run --directory <repo> terminal-mcp --allowed-root <dir>`。公开分发地址已确认是 `arnow117/terminal-mcp`；README 也给出等价 `uvx` 与通用 `mcpServers` JSON。客户端均以当前用户启动 server，显式 `<dir>` 使 `allowed_roots` 不依赖注册 command 的 cwd。
 
 ## 实现记录（实际）
 
@@ -569,6 +569,8 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form；Claude Code 使用
 - **FEAT-001-T03（实现完成，待主 Agent 验收）**：新增 `src/terminal_mcp/server.py`，接通 `__main__.py` 的真实 stdio CLI，扩展 `tests/conftest.py` 并新增 `tests/integration/test_mcp_stdio.py`；按已安装 mcp 2.3.0 源码使用构造式 handler 注册、SDK 消息流和 lifespan context，只发布 contracts.py 的五 Tool/schema/英文描述。成功返回 structuredContent 与有界短文本，预期业务错误返回 isError/error/code/message/hint 及同文摘要，内部异常脱敏；每次分派前校验参数，lifespan 在正常、异常、取消退出时均等待 shutdown_all。首次 RED：`uv run --offline pytest -q tests/integration/test_mcp_stdio.py --tb=short` 得 **3 failed, 40 errors**（2.14 s，exit 1），确认原因是 CLI 尚为占位实现而关闭握手连接及缺失 server 模块；实现后同命令得 **43 passed**（13.56 s），首次全量 **202 passed**（23.05 s）。补充 START_FAILED 保留身份、INTERNAL_ERROR 脱敏、取消 lifespan 三个测试并移除未使用的 fixture 开关后，设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 运行 `uv run --offline pytest -q` 得 **205 passed**（23.38 s，exit 0）；`uv lock --locked --offline`（37 packages）、`uv run --offline terminal-mcp --help`、`git diff --check` 均 exit 0。真实 stdio 覆盖 US1-1~3、US2-1~3、US3-1~3、US4-4、US5-1~2 与边界 3/5/6/7，另验证 pipe 分流、取消 read 不杀进程、终态 kill/remove 和所有 Tool 的结构化参数错误。无需修改 contracts.py/session.py，无新依赖、网络、真实用户 state 目录或 lifecycle 写入；审计/重启/真实 EOF 成功标准、README/Linux CI/Manus 实测分别留给 T04/T05/validate。
 
 - **FEAT-001-T04（实现完成，待主 Agent 验收）**：按决定 6 新增标准库原生 `procinfo.py`（macOS libproc / Linux procfs），统一 `owner_start_time`/`leader_start_time`；完成按实例注册表、状态变更原子持久化、flock/inode/owner/leader 三元身份保守清扫、SIGKILL 重启遗留组回收、600 秒 lost/SESSION_LOST、审计与策略回调、故障锁存和 EOF 删除实例文件。复审并更新前次测试草稿；本次原生模块 RED 为 **4 个收集错误**（exit 2），接线 RED 为 **2 failed**；原生单测先行 **8 passed**，首轮专项 **34 passed**。首次全量 **6 failed, 226 passed**（旧注册表参数和 T03 mock 接口未更新），以最小改动调整 `tests/unit/test_policy.py`、`test_audit_registry.py`、`tests/integration/test_mcp_stdio.py`；加强多进程重启测试后发现 macOS 短暂组探测 EPERM（**1 failed, 237 passed**），新增确定性 RED 后修复为有界等待；另新增审计失败不应阻止显式 kill 的 RED 后修复。所有运行设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 且使用 `uv run --offline`。最终未再改代码的两次完整 `pytest -q` 均 **240 passed**（46.72 s / 34.92 s，exit 0）；日志为 `.work/t04-full-green-1.log`、`.work/t04-full-green-2.log`，此前 RED 与专项日志同在忽略目录 `.work/`。专项测得 wait 延迟 **19.291 ms**、50 MB 输出 RSS 增长 **1,654,784 bytes**（小于 3 MiB）、突发期间最大 list 延迟 **2.213 ms**，retained bytes 始终不超过 1 MiB；两次最终全量也执行相同严格性能断言。US4-3、US6-1~4、US7-1、US2-4、边界 1/2/4/8 与 SC-003/004/005 均覆盖；原生身份测试含 self、child、exited child、pid 1、ABI/错误返回和 Linux stat 尾括号解析。未调用受禁进程命令、未联网、未添加依赖、未写真实用户 state/config/HOME、未修改或提交 state.json；README/CI 仍按计划留给 T05，Linux 真机与 Manus US8 验证仍由后续阶段完成。
+
+- **FEAT-001-T05（实现完成，待主 Agent 验收）**：新增唯一全局 usage 入口 `README.md`、MIT `LICENSE`、双平台 GitHub Actions `.github/workflows/ci.yml`，并在 `pyproject.toml` 补充 README/MIT 元数据；README 按实际 `tools/list` 契约记录五 Tool、游标/REPL/kill 流程、状态/错误恢复、TOML/路径/审计注册表、安全及生命周期边界，以及 Manus/Claude Code/Codex/JSON 的本地 `uv` 和公开 `uvx` 注册命令与 US1–US8（含 Manus 手工 E2E）映射。`uv.lock` 经检查无须变更。使用 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 验证 `uv lock --locked --offline`、`uv run --offline terminal-mcp --help`、`grep -n "/Users/" README.md`（无匹配）、Ruby YAML 结构检查和 `git diff --check` 均 exit 0；`uv run --offline pytest -q` 得 **240 passed**（38.32 s，exit 0）。未改运行时代码、测试或 `.sdlc-v1/state.json`，未联网、未新增依赖；Linux CI 运行与 Manus US8 仍留主 Agent validate。
 
 ## 验证记录（实际）
 
