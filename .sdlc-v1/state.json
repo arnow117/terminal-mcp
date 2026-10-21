@@ -16,7 +16,7 @@
         "by": null,
         "decision": "pending"
       },
-      "status": "validated",
+      "status": "in_progress",
       "tasks": {
         "FEAT-001-T01": {
           "depends_on": [],
@@ -60,14 +60,23 @@
           "status": "done",
           "title": "交付 README 全局 usage 入口和可复现本地验证",
           "updated_at": "2026-10-21T13:02:30Z"
+        },
+        "FEAT-001-T06": {
+          "depends_on": [
+            "FEAT-001-T05"
+          ],
+          "id": "FEAT-001-T06",
+          "status": "in_progress",
+          "title": "修复会话全成员清理与 spawn 竞态，加固审计权限与 CI 供应链",
+          "updated_at": "2026-10-21T14:00:45Z"
         }
       },
-      "updated_at": "2026-10-21T13:47:35Z",
+      "updated_at": "2026-10-21T14:00:45Z",
       "validation": {
-        "at": "2026-10-21T13:47:35Z",
-        "command": "uv run pytest -q",
-        "commit": "c2d633ab4f10572762ad7356ba74846f0598fa9c",
-        "result": "pass"
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
       }
     }
   },
@@ -81,9 +90,9 @@
       "id": "REQ-001",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
-      "status": "validated",
+      "status": "in_delivery",
       "title": "Agent 可用的终端会话 MCP Server（MVP）",
-      "updated_at": "2026-10-21T13:47:35Z"
+      "updated_at": "2026-10-21T14:00:45Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

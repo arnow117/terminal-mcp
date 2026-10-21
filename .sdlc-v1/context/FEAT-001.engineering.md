@@ -541,9 +541,15 @@ UV_CACHE_DIR=.work/uv-cache uv run terminal-mcp --help
    - **完成条件**：README 是唯一全局 usage 入口，按 Story 1 至 8 指回产品上下文；列出 actor、前置本机权限/环境、配置参数的 TOML/CLI 来源、默认范围、五 Tool 的组合步骤、错误恢复、当前支持边界；列出 uv/uvx、Manus/Claude Code/Codex 的 stdio 注册命令和 Story 8 的人工步骤；`uv.lock` 与声明相符。
    - **验证**：先以 README 命令从干净 uv cache 启动并跑 `--help`，再执行 `UV_CACHE_DIR=.work/uv-cache uv run pytest -q`。主 Agent 的 validate 阶段按 README 对 Manus 完成 US8，不能用本 Task 的合成测试替代。
 
+##### 阶段 6：评审返修（第 1 轮评审 R1/R2/R4/R5）
+6. **FEAT-001-T06 — 修复会话全成员清理与 spawn 竞态，加固审计权限与 CI 供应链**
+   - **代码范围**：`src/terminal_mcp/session.py`、`src/terminal_mcp/procinfo.py`（会话成员枚举）、`src/terminal_mcp/registry.py`（如需记录 SID）、`src/terminal_mcp/audit.py`、`.github/workflows/ci.yml`、`README.md`（审计内容说明、R3 已知限制）及对应 `tests/`。
+   - **依赖**：`FEAT-001-T05`。
+   - **完成条件**：（R1）PTY/pipe 会话终止、timeout、stdio EOF/shutdown 与（leader 身份仍匹配时的）重启清扫，均覆盖 SID 等于会话 leader PID 的全部成员进程组，所有目标确认消失后才标记清理完成；只对确认属于该会话的 PGID 发信号。（R2）spawn 未完成的会话不出现在 `terminal_list`，kill/shutdown/watchdog 与 spawn 完成屏障协调，不缓存无进程的空清理，kill 输出始终符合 schema；被取消的 start 清理其已创建进程。（R4）已存在的审计文件经 `fstat` 校验为当前用户的普通文件，权限宽于 0600 时收紧，异常则按审计失败处理；README 说明 `command` 字段含完整命令与提交的输入行。（R5）CI 固定 action 完整 SHA 并声明 `permissions: contents: read`。补协议层（真实 stdio）US4-1/US4-2 回归与 SC-003 等待同步。
+   - **验证**：先写失败回归（真实 stdio：交互 bash 后台 job 在 kill、EOF、timeout 后均消失；并发 start/list/kill；取消 start；预建 0644 审计文件），确认 RED 后实现；全量 `uv run pytest -q` 连续两次通过。
 #### 依赖与执行顺序
 
-`FEAT-001-T01 → FEAT-001-T02 → FEAT-001-T03 → FEAT-001-T04 → FEAT-001-T05`。所有 Task 由一个实现子 Agent 串行、测试先行完成；任一失败先修复当前 Task，不跨 Task 提前实现。
+`FEAT-001-T01 → FEAT-001-T02 → FEAT-001-T03 → FEAT-001-T04 → FEAT-001-T05 → FEAT-001-T06`（T06 为第 1 轮评审返修）。所有 Task 由一个实现子 Agent 串行、测试先行完成；任一失败先修复当前 Task，不跨 Task 提前实现。
 
 #### 全局 usage 入口与参数来源
 
@@ -594,8 +600,14 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form（command 为 `uv`�
 
 ## 评审记录（实际）
 
-- **状态**：尚未执行：实现和验证证据具备后进行评审。
-- **范围、发现与处理**：`none`。
+- **第 1 轮（2026-10-21）**：独立只读 review Agent（与实现者不同），角色 `qa`、`server-dev`、`architect`、`security`；评审 `git diff 99b09d5..c2d633a -- . ':(exclude).sdlc-v1/**'`（30 文件），离线复跑 240 passed。结论 **changes_requested**。重复实现与工程债：未发现有证据支持的项；scope drift：未发现。
+- **意见与处理（主 Agent 核实后）**：
+  - **R1 must_fix，已接纳待实施**：`session.py` 终止只覆盖 leader PGID 与当时的前台 PGID；PTY 内 `bash -i` 的 `cmd &` 后台 job 处于同一 SID、独立 PGID，`terminal_kill` 与 stdio EOF 后仍存活，违反 US4、SC-004、REQ-F05。复现：PTY 启动交互 bash，写入 `sleep 60 & echo BG:$!`，kill 后 sleep 仍在。处理：按会话 SID（= leader PID，由 `setsid` 建立）枚举并核验全部成员 PGID 后统一 TERM→KILL，全部确认消失才标记清理完成；补真实 stdio 回归。
+  - **R2 must_fix，已接纳待实施**：会话在 spawn 完成前已加入表并可被 `terminal_list` 看到，公共 kill 不等待 spawn，会对无 PID 的会话完成空清理并永久缓存，随后创建的进程逃过 kill/watchdog/shutdown，且 kill 可返回不合 schema 的 `status=running`。处理：spawn 未完成的会话不对外可见；kill/shutdown 先与 spawn 屏障协调；取消的 start 清理其进程；补并发回归。
+  - **R4 should_fix，本轮接纳**：已存在的 `audit.jsonl` 不校验/收紧权限；README 需说明 `command` 字段含完整命令与已提交的输入行。处理：打开后 `fstat` 校验为普通文件且属当前用户，权限宽于 0600 时收紧；README 补充说明。
+  - **R5 should_fix，本轮接纳**：CI actions 使用可移动标签且无最小权限。处理：固定到当前已验证主版本的完整 SHA（`actions/checkout` v4.4.0 `11d5960a326750d5838078e36cf38b85af677262`，`astral-sh/setup-uv` v6.8.0 `d0cc045d04ccac9d8b7881df0226f9e82c39688e`），声明 `permissions: contents: read`。
+  - **R3 should_fix，非阻塞延后到 REQ-002**：pipe 模式 stdout/stderr 高频小块交错时，每片段独立 `_Chunk` 造成元数据开销（组件实验：同 64 KiB 保留量交错时分配约 12 MB），仍有理论上界。延后理由：需改为紧凑字节环 + 流区间表示，属于缓冲层重写，当前 MVP 验收（SC-005 单流 50 MB）已满足；适用局限写入 README 已知限制。重访触发：REQ-002 优化轮或出现 pipe 交错输出内存/延迟反馈。
+  - **覆盖缺口（随 R1/R2 一并补）**：US4-1/US4-2 的协议层（真实 stdio）kill 回归；SC-003 测试显式确保 read 已进入等待后再产生输出。
 
 ## 发布与观察记录（实际）
 
