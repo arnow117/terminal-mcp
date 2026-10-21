@@ -243,3 +243,34 @@ async def test_transient_eperm_still_requires_group_disappearance(manager, monke
     assert result["status"] == "exited"
     assert not result["escalated"]
     await assert_pids_gone([started["pid"]], time.monotonic() + 1)
+
+
+async def test_stdio_eof_reaps_all_groups(tmp_path):
+    from test_restart import connection, gone
+
+    async with connection(tmp_path) as server:
+        started = [await server.call("terminal_start", {
+            "command": GROUP_COMMAND, "mode": mode, "wait_ms": 2000, "until": r"\d+ \d+ \d+",
+        }) for mode in ("pty", "pipe")]
+        pids = [int(part) for row in started for part in (row["output"] or row["stdout"]).split()]
+        path, = (server.state / "sessions").glob("*.json")
+        before = time.monotonic()
+        # Close the actual stdin while the SDK transport is still active. The SDK's
+        # fallback process-tree termination cannot make this assertion pass.
+        await server.process.stdin.aclose()
+        with anyio.fail_after(2):
+            assert await server.process.wait() == 0
+            await gone(pids, before + 2)
+        assert time.monotonic() - before <= 2
+        assert not path.exists()
+
+
+async def test_stdio_two_second_timeout(tmp_path):
+    from test_restart import connection, gone
+
+    async with connection(tmp_path) as server:
+        started = await server.call("terminal_start", {"command": GROUP_COMMAND, "mode": "pipe", "timeout_s": 2, "wait_ms": 1000, "until": r"\d+ \d+ \d+"})
+        pids = [int(part) for part in started["stdout"].split()]
+        result = await server.call("terminal_read", {"session_id": started["session_id"], "cursor": started["next_cursor"], "wait_ms": 4000, "until": "(?!)"})
+        assert result["status"] == "timed_out"
+        await gone(pids, time.monotonic() + 2)

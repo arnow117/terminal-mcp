@@ -1,5 +1,6 @@
 """Five session tools over the official low-level MCP stdio server."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.stdio import stdio_server
 
 from . import __version__
+from .audit import AuditCall, current_call
 from .config import Config
 from .contracts import TOOL_SCHEMAS, ToolError, validate_arguments
 from .session import SessionManager
@@ -64,10 +66,27 @@ def _summary(name: str, result: dict) -> str:
 async def on_call_tool(
     ctx: ServerRequestContext[AppContext], params: types.CallToolRequestParams,
 ) -> types.CallToolResult:
+    manager = ctx.lifespan_context.manager
+    call = AuditCall(params.name, params.arguments or {}, manager)
+    token = current_call.set(call)
+    result, error = None, None
+    cancelled = False
     try:
+        # This preflight audit must succeed before a tool can create a process.
+        try:
+            manager.log_audit(call.event(decision="pending"))
+        except ToolError:
+            # Broken audit storage must not prevent explicit ownership cleanup.
+            # The safety latch and completion audit still return INTERNAL_ERROR.
+            if params.name != "terminal_kill":
+                raise
         arguments = validate_arguments(params.name, {} if params.arguments is None else params.arguments)
-        method = getattr(ctx.lifespan_context.manager, _TOOL_METHODS[params.name])
+        method = getattr(manager, _TOOL_METHODS[params.name])
         result = await method(**arguments)
+        manager.check_persistence()
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except ToolError as exc:
         error = exc
     except Exception:
@@ -75,7 +94,17 @@ async def on_call_tool(
         # Cancellation is a BaseException and must propagate to the SDK unchanged.
         logger.error("INTERNAL_ERROR while handling %s.", params.name)
         error = ToolError("INTERNAL_ERROR", "The tool could not complete because of an internal error.")
-    else:
+    finally:
+        try:
+            manager.log_audit(call.event(
+                result=result if result is not None else error.as_dict() if error else None,
+                error_code="CANCELLED" if cancelled else error.code if error else None,
+            ))
+        except ToolError as exc:
+            error = exc
+        finally:
+            current_call.reset(token)
+    if error is None:
         return types.CallToolResult(
             structured_content=result,
             content=[types.TextContent(type="text", text=_summary(params.name, result))],
@@ -93,6 +122,7 @@ def create_server(config: Config) -> Server[AppContext]:
     async def lifespan(server: Server[AppContext]) -> AsyncIterator[AppContext]:
         manager = SessionManager(config)
         try:
+            await manager.initialize()
             yield AppContext(manager=manager)
         finally:
             # EOF, handler failure, and cancellation share the same ownership boundary.

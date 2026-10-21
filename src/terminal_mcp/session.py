@@ -14,11 +14,14 @@ import termios
 import time
 from uuid import uuid4
 
+from .audit import Audit, current_call
 from .buffer import OutputBuffer
 from .config import Config
 from .contracts import ToolError, validate_arguments
 from .keys import encode_keys
 from .policy import CompleteLineTracker, Policy, PreparedStart
+from .procinfo import ProcessProbeError, process_identity
+from .registry import Registry, RegistryRecord
 
 
 _REPORT_INTERVAL = 0.01
@@ -41,6 +44,7 @@ class Session:
     rows: int = 24
     pid: int | None = None
     pgid: int | None = None
+    leader_start_time: str | None = None
     status: str = "running"
     exit_code: int | None = None
     signal: str | None = None
@@ -91,16 +95,84 @@ class SessionManager:
 
     Public operations are async and accept the corresponding tool's keyword arguments.
     Policy checks and pending input state share the same lock as actual writes.
-    Registry persistence and audit dispatch belong to the server lifecycle layer.
+    State transitions persist synchronously; the server supplies per-call audit context.
     """
 
     def __init__(self, config: Config):
         self.config = config
-        self.policy = Policy(config)
+        self.policy = Policy(config, self._policy_decision)
+        self.audit = Audit(config.state_dir / "audit.jsonl")
+        self.registry: Registry | None = None
         self.sessions: dict[str, Session] = {}
         self._start_lock = asyncio.Lock()
+        self._initialize_lock = asyncio.Lock()
+        self._initialized = False
+        self._persistence_failed = False
         self._closing = False
         self._shutdown_task: asyncio.Task | None = None
+
+    async def initialize(self) -> None:
+        async with self._initialize_lock:
+            if self._initialized:
+                return
+            try:
+                owner = process_identity(os.getpid())
+                if owner is None:
+                    raise ProcessProbeError("Cannot confirm the server's identity")
+                self.registry = Registry(self.config.state_dir, owner_pid=owner.pid, owner_start_time=owner.start_time)
+                self._persist()
+                await self.registry.sweep(self._accept_lost, self.config.kill_grace_ms)
+                self._initialized = True
+            except OSError as exc:
+                self._persistence_failed = True
+                raise ToolError("INTERNAL_ERROR", "Cannot initialize reliable process ownership.") from exc
+
+    def _accept_lost(self, records: list[RegistryRecord]) -> None:
+        for record in records:
+            if record.session_id in self.sessions:
+                continue
+            session = Session(record.session_id, None, None, str(self.config.startup_cwd),
+                              "pipe", self.config.default_timeout_s,
+                              OutputBuffer(self.config.buffer_bytes, mode="pipe"),
+                              pid=record.leader_pid, pgid=record.pgid,
+                              leader_start_time=record.leader_start_time, status="lost",
+                              started_at=record.started_at, ended_at=_timestamp(),
+                              ended_monotonic=time.monotonic(), writes_closed=True, group_cleaned=True)
+            session.exited.set()
+            session.buffer.close_stream("stdout")
+            session.buffer.close_stream("stderr")
+            self.sessions[session.session_id] = session
+            self._schedule_gc(session)
+        self._persist()
+
+    def check_persistence(self) -> None:
+        if self._persistence_failed:
+            raise ToolError("INTERNAL_ERROR", "Persistence failed; restart the server after repairing its state directory.")
+
+    def _persist(self, *, strict: bool = True) -> None:
+        if self.registry is None:
+            return
+        try:
+            self.registry.write(RegistryRecord(session.session_id, session.pid, session.pgid,
+                                               session.leader_start_time, session.started_at, session.status)
+                                for session in self.sessions.values())
+        except OSError as exc:
+            self._persistence_failed = True
+            if strict:
+                raise ToolError("INTERNAL_ERROR", "Cannot persist session ownership.") from exc
+
+    def log_audit(self, event: dict) -> None:
+        try:
+            self.audit.log(event)
+        except OSError as exc:
+            self._persistence_failed = True
+            raise ToolError("INTERNAL_ERROR", "Cannot append the required audit record.") from exc
+
+    def _policy_decision(self, decision: str, rule_id: str | None, command: str | None) -> None:
+        call = current_call.get()
+        if call is not None:
+            self.log_audit(call.event(decision=decision, rule_id=rule_id, command=command,
+                                     error_code="POLICY_DENIED" if decision == "deny" else None))
 
     def _get(self, session_id: str) -> Session:
         try:
@@ -110,6 +182,8 @@ class SessionManager:
 
     async def start(self, **arguments) -> dict:
         args = validate_arguments("terminal_start", arguments)
+        await self.initialize()
+        self.check_persistence()
         prepared = self.policy.prepare_start(**{key: args[key] for key in ("command", "cwd", "env", "timeout_s") if key in args})
         async with self._start_lock:
             if self._closing:
@@ -121,6 +195,12 @@ class SessionManager:
                               OutputBuffer(self.config.buffer_bytes, mode=args["mode"]),
                               cols=args["cols"], rows=args["rows"])
             self.sessions[session.session_id] = session
+            try:
+                # Refuse creation if even the pre-spawn snapshot cannot be published.
+                self._persist()
+            except ToolError:
+                self.sessions.pop(session.session_id, None)
+                raise
             session.spawn_task = asyncio.create_task(self._spawn(session, prepared))
             # A cancelled start request does not abandon an in-flight spawn or its error.
             session.spawn_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
@@ -173,10 +253,27 @@ class SessionManager:
             session.exited.set()
             session.notify()
             self._schedule_gc(session)
+            self._persist()
             raise ToolError("START_FAILED", f"Cannot create session: {exc}.",
                             session_id=session.session_id, status=session.status) from exc
         session.reaper_task = asyncio.create_task(self._reap(session))
         session.watchdog_task = asyncio.create_task(self._watchdog(session))
+        try:
+            # The PTY child may not have completed setsid when fork returns.
+            deadline = asyncio.get_running_loop().time() + 1
+            while (identity := process_identity(session.pid)) is not None:
+                if identity.pgid == session.pgid:
+                    session.leader_start_time = identity.start_time
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ProcessProbeError("Cannot confirm the new process group")
+                await asyncio.sleep(_REPORT_INTERVAL)
+            self._persist()
+        except (OSError, ToolError) as exc:
+            self._persistence_failed = True
+            # A post-spawn persistence failure cannot leave an unregistered process.
+            await self._terminate(session, "KILL", 0, "shutdown")
+            raise ToolError("INTERNAL_ERROR", "Cannot persist the new process identity.") from exc
 
     def _append(self, session: Session, stream: str, data: bytes) -> None:
         session.buffer.append(stream, data)
@@ -248,6 +345,7 @@ class SessionManager:
         session.exited.set()
         session.notify()
         self._schedule_gc(session)
+        self._persist(strict=False)
         # Keep owning descendants after leader exit, but release dead groups promptly
         # so a retained result can never signal a PGID reused during its 600-second TTL.
         while self._group_exists(session.pgid):
@@ -263,8 +361,10 @@ class SessionManager:
 
     async def _gc(self, session: Session) -> None:
         await asyncio.sleep(self.config.exit_retention_s)
-        await self._terminate(session, "TERM", self.config.kill_grace_ms, "shutdown")
+        if session.status != "lost":
+            await self._terminate(session, "TERM", self.config.kill_grace_ms, "shutdown")
         self.sessions.pop(session.session_id, None)
+        self._persist(strict=False)
 
     async def _watchdog(self, session: Session) -> None:
         await asyncio.sleep(session.timeout_s)
@@ -404,6 +504,7 @@ class SessionManager:
                 session.gc_task.cancel()
                 await asyncio.gather(session.gc_task, return_exceptions=True)
             self.sessions.pop(session_id, None)
+            self._persist()
         return session.result() | {"termination_reason": session.termination_reason or "manual",
                                    "escalated": session.escalated, "removed": args["remove"], "ended_at": session.ended_at}
 
@@ -484,7 +585,8 @@ class SessionManager:
             self._closing = True
             sessions = list(self.sessions.values())
         await asyncio.gather(*(session.spawn_task for session in sessions if session.spawn_task is not None), return_exceptions=True)
-        results = await asyncio.gather(*(self._terminate(session, "TERM", self.config.kill_grace_ms, "shutdown") for session in sessions), return_exceptions=True)
+        results = await asyncio.gather(*(self._terminate(session, "TERM", self.config.kill_grace_ms, "shutdown")
+                                         for session in sessions if session.status != "lost"), return_exceptions=True)
         background = [task for session in sessions for task in (session.gc_task, session.watchdog_task) if task is not None]
         for task in background:
             task.cancel()
@@ -492,3 +594,5 @@ class SessionManager:
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+        if self.registry is not None:
+            self.registry.path.unlink(missing_ok=True)

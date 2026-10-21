@@ -1,10 +1,13 @@
 """Metadata-only JSONL audit records shared safely by local server instances."""
 
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import errno
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 
@@ -49,3 +52,44 @@ class Audit:
                 raise OSError(errno.EIO, "Incomplete audit write")
         finally:
             os.close(fd)
+
+
+@dataclass
+class AuditCall:
+    tool: str
+    arguments: dict
+    manager: Any
+    began: float = field(default_factory=time.monotonic)
+
+    def event(self, *, decision="not_applicable", rule_id=None, command=None,
+              result=None, error_code=None) -> dict:
+        args = self.arguments
+        result = result or {}
+        sid = result.get("session_id", args.get("session_id"))
+        session = self.manager.sessions.get(sid) if isinstance(sid, str) else None
+        summary = {key: value for key, value in args.items()
+                   if key in _SUMMARY_KEYS - {"keys"} and type(value) in (int, float, bool)}
+        for source, target in (("env", "env_count"), ("keys", "key_count"), ("until", "until_length")):
+            value = args.get(source)
+            if isinstance(value, (dict, list, str)):
+                summary[target] = len(value)
+        if isinstance(args.get("text"), str):
+            summary["text_bytes"] = len(args["text"].encode("utf-8"))
+        if self.tool == "terminal_start":
+            command = args.get("command") if isinstance(args.get("command"), str) else None
+        return {
+            "tool": self.tool, "session_id": sid,
+            "command": command,
+            "cwd": session.cwd if session else args.get("cwd", str(self.manager.config.startup_cwd)),
+            "mode": session.mode if session else args.get("mode"),
+            "parameter_summary": summary,
+            "policy": {"decision": decision, "rule_id": rule_id},
+            "result": {"status": result.get("status", session.status if session else None),
+                       "exit_code": result.get("exit_code", session.exit_code if session else None),
+                       "signal": result.get("signal", session.signal if session else None),
+                       "error_code": error_code},
+            "duration_ms": (time.monotonic() - self.began) * 1000,
+        }
+
+
+current_call: ContextVar[AuditCall | None] = ContextVar("audit_call", default=None)

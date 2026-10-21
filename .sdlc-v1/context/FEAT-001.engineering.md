@@ -40,7 +40,7 @@ server.py: 低层 Server、schema、校验、Tool 分派、isError 结果
   │                            │
   │                            ├── policy.py ── audit.py
   ▼                            └── config.py
-session.py: SessionManager ─── registry.py
+session.py: SessionManager ─── registry.py ─── procinfo.py
   ├── PTY 后端（pty.fork，控制 TTY）
   ├── pipe 后端（asyncio subprocess，stdout/stderr）
   ├── kill/timeout/reap/GC
@@ -52,13 +52,13 @@ session.py: SessionManager ─── registry.py
 ##### `server.py`：MCP Tool 层
 
 - **职责**：用官方低层 `Server` 声明五个 Tool 的 JSON Schema，手动校验请求、调用 `SessionManager`，把成功结果写入 `structuredContent` 与简短文本摘要；把预期业务失败写成 `CallToolResult(is_error=True)`。
-- **接口**：`create_server(config)` 创建低层 `Server`；已核对安装的 mcp 2.3.0 源码，handler 通过构造参数 `on_list_tools` / `on_call_tool` 注册，签名为 `(ctx, params)`，从 `ctx.lifespan_context.manager` 访问会话管理器。`run_stdio(config)` 用 `stdio_server()` 取得 SDK 消息流后调用 `Server.run(read, write, server.create_initialization_options())`，CLI 使用 `asyncio.run`。lifespan 在启动时创建 `SessionManager` 和 `AppContext`，关闭 `finally` 在 AnyIO cancellation shield 中无条件等待 `shutdown_all()`。Tool 层先用 `validate_arguments` 校验，再按固定白名单分派；不吞取消异常。预期错误保留 `ToolError.as_dict()`（含 START_FAILED 的身份字段），非预期异常只回传脱敏的 INTERNAL_ERROR。成功文本包含状态/游标等摘要与有界输出预览，完整输出只保留在 structuredContent，避免复制整页。
+- **接口**：`create_server(config)` 创建低层 `Server`；已核对安装的 mcp 2.3.0 源码，handler 通过构造参数 `on_list_tools` / `on_call_tool` 注册，签名为 `(ctx, params)`，从 `ctx.lifespan_context.manager` 访问会话管理器。`run_stdio(config)` 用 `stdio_server()` 取得 SDK 消息流后调用 `Server.run(read, write, server.create_initialization_options())`，CLI 使用 `asyncio.run`。lifespan 在启动时创建 `SessionManager`，等待 `initialize()` 完成独立注册表与安全 sweep 后提供 `AppContext`，关闭 `finally` 在 AnyIO cancellation shield 中无条件等待 `shutdown_all()`。Tool 层先用 `validate_arguments` 校验，再按固定白名单分派；不吞取消异常。预期错误保留 `ToolError.as_dict()`（含 START_FAILED 的身份字段），非预期异常只回传脱敏的 INTERNAL_ERROR。成功文本包含状态/游标等摘要与有界输出预览，完整输出只保留在 structuredContent，避免复制整页。
 - **覆盖**：`REQ-F01`、`REQ-F02`、`REQ-F03`、`REQ-F04`、`REQ-F05`、`REQ-F06`、`REQ-F07`。
 
 ##### `session.py`：`Session` 与 `SessionManager`
 
 - **职责**：拥有进程句柄/PTY FD、PID/PGID、状态、并发写锁、timeout task、退出信息和输出通知；创建两个后端，串行化同一会话写入，维护 16 会话限制，负责整组信号、reap、保留和 GC。
-- **接口**：`SessionManager(config)`，六个入口均为 async：`start(**tool_arguments)`、`read(session_id, cursor, **options)`、`write(session_id, **options)`、`list(session_id=None, include_exited=True)`、`kill(session_id, **options)`、`shutdown_all()`；成功返回与 `contracts.py` 对应的普通 dict，业务错误抛 `ToolError`。Manager 复用参数校验和 `Policy`，完整行 tracker 与实际 write 共用写锁；取消/失败的部分写入后禁用该会话后续写入，避免 tracker 与已发送内容失配。调用者绝不直接操作 `Popen`/FD；T03 负责 MCP 分派，T04 负责审计/注册表接线。
+- **接口**：`SessionManager(config)`，六个入口均为 async：`start(**tool_arguments)`、`read(session_id, cursor, **options)`、`write(session_id, **options)`、`list(session_id=None, include_exited=True)`、`kill(session_id, **options)`、`shutdown_all()`；成功返回与 `contracts.py` 对应的普通 dict，业务错误抛 `ToolError`。Manager 复用参数校验和 `Policy`，完整行 tracker 与实际 write 共用写锁；取消/失败的部分写入后禁用该会话后续写入，避免 tracker 与已发送内容失配。调用者绝不直接操作 `Popen`/FD；T03 负责 MCP 分派；T04 已接通 `initialize()`、每次状态变化的 `_persist()`、`_accept_lost()`、故障锁存与策略审计回调。内部直接调用 start 时也会幂等初始化。
 - **覆盖**：`REQ-F01` 至 `REQ-F05`。
 
 ##### `buffer.py`：有界原始字节输出缓冲
@@ -88,7 +88,7 @@ session.py: SessionManager ─── registry.py
 ##### `audit.py` 与 `registry.py`：可审计生命周期
 
 - **职责**：追加 JSONL 审计而不记录输出正文；原子保存最少的会话注册表；启动时安全清扫上一进程遗留组并标记旧记录 `lost`。
-- **接口**：T01 提供 `Audit(path).log(event)`、`Registry(state_dir, owner_pid, owner_lstart, instance_id).load/snapshot/write`、不可变 `RegistryRecord` 与纯比较函数 `owner_is_live` / `record_matches_process`；PID/lstart 采集、`flock`、扫描和实际发信号仅由 T04 接线。探测失败不等同于 owner 不存在，T04 必须保守跳过无法确认的文件。
+- **接口**：`Audit(path).log(event)`、请求级 `AuditCall`/`current_call`（ContextVar 隔离并发请求）、`Registry(state_dir, owner_pid, owner_start_time, instance_id).load/snapshot/write/sweep`、不可变 `RegistryRecord` 与纯比较函数 `owner_is_live` / `record_matches_process`；`procinfo.py` 负责原生 PID/PGID/启动时间和 RSS。`sweep(accept_records, grace_ms)` 在文件锁内确认旧 owner、预检全部 leader、逐组清理，再调用 manager 持久化 lost 记录，最后删除旧文件。探测失败不等同于 owner 不存在，无法确认或格式损坏的文件保守保留。
 - **覆盖**：`REQ-F04`、`REQ-F05`、`REQ-F08`。
 
 ##### 建议包布局
@@ -106,6 +106,7 @@ src/terminal_mcp/
   config.py                # TOML、平台默认路径
   audit.py                 # JSONL 追加器
   registry.py              # 按实例分文件的会话注册表、启动清扫
+  procinfo.py              # 标准库原生进程身份与 RSS 探测
 ```
 
 #### 关键设计决定
@@ -137,7 +138,7 @@ src/terminal_mcp/
 ##### 决定 4：多实例并存时按实例隔离注册表
 
 - **背景**：Manus、Claude Code、Codex 可能同时各自启动一个 `terminal-mcp` 进程。若所有实例共用一个 `sessions.json`，新实例的启动清扫会把另一个仍在运行的实例的会话当作遗留进程杀掉，并发写同一文件也会互相覆盖。
-- **决定**：每个实例只写自己的注册表文件，文件内记录 owner 的 PID 与 `lstart`；启动清扫只处理 owner 已不存在的文件，处理前对该文件取 `fcntl.flock` 排他锁，防止两个新实例同时清扫同一文件。审计 JSONL 由多个实例以 `O_APPEND` 单次 `write` 追加整行。
+- **决定**：每个实例只写自己的注册表文件，文件内记录 owner 的 PID 与 `owner_start_time` 原生令牌；启动清扫只处理 owner 已不存在的文件，处理前对该文件取 `fcntl.flock` 排他锁，防止两个新实例同时清扫同一文件。审计 JSONL 由多个实例以 `O_APPEND` 单次 `write` 追加整行。
 - **替代项**：全局单文件 + 文件锁（仍无法区分活实例与已退出实例的会话）。
 - **取舍**：多一次目录扫描；换来“不会误杀其他活实例的会话”这一必须满足的安全属性。
 - **覆盖**：`REQ-F05`、US7。
@@ -149,14 +150,23 @@ src/terminal_mcp/
 - **取舍**：中文用户阅读 README 略增成本；换来公开项目和多数客户端模型的一致理解。README 可附一段简短中文说明。
 - **覆盖**：`REQ-F06`、`REQ-F07`。
 
+##### 决定 6：用原生接口读取进程身份与内存，不调用 `ps`
+
+- **背景**：macOS 的 `/bin/ps` 是 setuid root 程序，在受沙箱约束的执行环境（包括本机 Agent 执行环境，也可能包括 MCP 客户端拉起的服务进程）中执行会得到 `Operation not permitted`；同时 `ps -o lstart=` 输出依赖本地化时间格式且精度只有秒，每次探测还要多起一个子进程。
+- **决定**：新增 `src/terminal_mcp/procinfo.py`，只用标准库：macOS 通过 `ctypes` 调用 `libproc` 的 `proc_pidinfo(pid, PROC_PIDTBSDINFO)` 读取 `pbi_pid`、`pbi_pgid`、`pbi_start_tvsec`/`pbi_start_tvusec`，以 `PROC_PIDTASKINFO` 的 `pti_resident_size` 读取 RSS；Linux 读取 `/proc/<pid>/stat` 的 pgrp 与 starttime（clock ticks）并结合 `/proc/sys/kernel/random/boot_id`，RSS 读取 `/proc/<pid>/statm`。接口为 `process_identity(pid) -> ProcessIdentity(pid, pgid, start_time) | None` 与 `process_rss(pid) -> int | None`；`start_time` 是不透明字符串令牌（macOS `"<sec>.<usec>"`，Linux `"<boot_id>:<ticks>"`）。返回值区分三种情况：进程存在（返回身份）、确定不存在（`ESRCH`，返回 `None`）、无法确认（`EPERM` 或其他错误，抛 `ProcessProbeError`）；清扫时“无法确认”一律按“不发信号、不删除文件”处理。
+- **字段命名**：注册表与代码中原 `owner_lstart`/`leader_lstart` 统一改名为 `owner_start_time`/`leader_start_time`，语义为上述令牌；文中其余提到 `lstart` 处均按此理解。
+- **替代项**：继续调用 `ps`（在受限环境不可用）；引入 `psutil`（含原生编译扩展，违背 DEC-001）。
+- **取舍**：维护一小段 `ctypes` 结构体定义（`proc_bsdinfo` 136 字节，主 Agent 已在本机验证读出 PID/PGID/微秒级启动时间与 RSS，对非本用户进程返回 `EPERM`、对已退出进程返回 `ESRCH`）；换来无外部命令、无本地化解析、精度更高的身份校验。
+- **覆盖**：`REQ-F05`、US7、SC-005。
+
 #### 数据模型 / 关键实体
 
 | 实体 | 关键字段 | 约束 | 覆盖 |
 |---|---|---|---|
 | `Session` | `session_id` UUID、`name`、`command`、`cwd`、`mode`、`pid`、`pgid`、`status`、`exit_code`、`signal`、`started_at`、`ended_at`、`last_activity_at`、`timeout_s` | 状态仅为 `running`、`exited`、`signaled`、`timed_out`、`failed_to_start`、`lost`；仅 `running` 可写；PID/PGID 均为当前用户子进程。 | `REQ-F01`、`REQ-F03`、`REQ-F04`、`REQ-F05` |
 | `OutputBuffer` | `start_offset`、`end_offset`、带 stream 标签的 byte chunks、`capacity_bytes` | 偏移绝不回退；默认容量 1,048,576；淘汰只从最旧字节开始。 | `REQ-F02`、`REQ-F06` |
-| `RegistryRecord` | `session_id`、`leader_pid`、`pgid`、`leader_lstart`、`started_at`、`status` | `leader_lstart` 为 `ps -o lstart=` 的去空白原文；仅在 PID、PGID、启动时刻全匹配时允许重启 sweep 向组发信号。 | `REQ-F04`、`REQ-F05` |
-| `RegistryFile` | `owner_pid`、`owner_lstart`、`records: RegistryRecord[]` | 每个服务实例只写自己的文件 `sessions/<owner_pid>-<启动时间戳>.json`；只有 owner 进程已不存在（PID 不存在或 lstart 不匹配）时，其他实例才可清扫该文件。 | `REQ-F04`、`REQ-F05` |
+| `RegistryRecord` | `session_id`、`leader_pid`、`pgid`、`leader_start_time`、`started_at`、`status` | `leader_start_time` 为 `procinfo.process_identity()` 返回的启动时间令牌（决定 6）；仅在 PID、PGID、启动时刻全匹配时允许重启 sweep 向组发信号。 | `REQ-F04`、`REQ-F05` |
+| `RegistryFile` | `owner_pid`、`owner_start_time`、`records: RegistryRecord[]` | 每个服务实例只写自己的文件 `sessions/<owner_pid>-<instance_id>.json`；只有 owner 进程已不存在（PID 不存在或启动时间令牌不匹配；无法确认时视为仍存活）时，其他实例才可清扫该文件。 | `REQ-F04`、`REQ-F05` |
 | `Policy` | `allowed_roots`、`env_deny_patterns`、`dangerous_command_rules`、`max_sessions`、`buffer_bytes` | allowed root 与 cwd 均使用存在路径的 realpath；规则拒绝优先于 spawn/write。 | `REQ-F08` |
 | `AuditEvent` | `timestamp`、`tool`、`session_id`、`command`、`cwd`、`policy`、`result`、`duration_ms` | 每行一个 JSON；绝不写 `output`、`stdout` 或 `stderr` 正文，环境变量值也不写。 | `REQ-F08` |
 
@@ -291,7 +301,7 @@ src/terminal_mcp/
 - **终止与 reap**：先向 `os.killpg(pgid, signal)` 发首信号，等待最多 `grace_ms`，存活则 `SIGKILL` 整组；PTY 仅对自己创建的 leader 用 `waitpid(..., WNOHANG)`，pipe 由 asyncio child watcher 回收，读取 `returncode` 与 drain EOF 分离，避免后台持有流时 `Process.wait()` 阻塞退出报告。leader 退出后仍观察原组；自然消失立即关闭 I/O 并标记 group_cleaned，保留窗口内的幂等 kill/GC 不再次发信号。父 shell 已退出而后台子进程还持有 PTY 时，仍按已保存 pgid 杀整组。PTY job-control 的前台 PGID 若经 `getsid` 验证属于本会话，也纳入该次终止。macOS 退出窗口的 EPERM 只按“仍存在/尚未证明清理成功”处理，最终必须观察组消失，否则在 KILL 后 1 秒报告 INTERNAL_ERROR；不会把 EPERM 当作已杀灭。信号结果采用 `SIGTERM`/`SIGKILL` 等标准名称；显式 KILL 不计 escalated，宽限后升级才计 true。shutdown、kill 和 spawn 所有权任务屏蔽调用方取消，读/写响应等待取消不终止进程。
 - **会话状态**：`running`；`exited`（退出码）；`signaled`（信号）；`timed_out`（watchdog 引发）；`failed_to_start`（OS spawn 失败，伴随 `START_FAILED` 结构化错误）；`lost`（重启前遗留、不能接管）。`timeout_s` 满足后使用 TERM、配置的 1,000 ms 宽限、KILL；`terminal_kill` 的 `signal` 与 `grace_ms` 覆盖该次手动序列。
 - **连接结束**：stdio stdin EOF 或 server 的正常关闭导致 SDK lifespan `finally`；它首先停止接收新调用，再杀灭本实例所有进程组并 reap。没有 daemon，因此不会把会话移交给未来连接。
-- **注册表和重启 sweep**：状态目录 macOS 为 `~/Library/Application Support/terminal-mcp/`，Linux 为 `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`，可用 `--state-dir` 覆盖（测试必须用临时目录）。每个实例只写 `sessions/<owner_pid>-<启动时间戳>.json`，以临时文件 `fsync` 后 `os.replace` 原子更新；文件含 owner 的 PID 与 `lstart`，每条记录含 leader 的 PID、PGID 与 `ps -o lstart= -p <pid>` 去空白原文。新实例启动时扫描 `sessions/`：owner PID 仍存在且 `lstart` 匹配的文件属于活实例，跳过；其余文件先取 `fcntl.flock` 排他锁（取不到则跳过），对每条记录再执行 `ps -o pid=,pgid=,lstart= -p <pid>`，三值都匹配才对 PGID 发 HUP/TERM→KILL，否则绝不发信号。处理完的记录并入新实例内存中的 `lost` 列表（可 `terminal_list(include_exited=true)` 查询 600 秒后 GC），并删除原文件；新实例不恢复 I/O 或接管。实例正常退出时在杀完全部会话后删除自己的文件。
+- **注册表和重启 sweep**：状态目录 macOS 为 `~/Library/Application Support/terminal-mcp/`，Linux 为 `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`，可用 `--state-dir` 覆盖（测试必须用临时目录）。每个实例只写 `sessions/<owner_pid>-<instance_id>.json`，以临时文件 `fsync` 后 `os.replace` 原子更新；文件含 owner 的 PID 与启动时间令牌，每条记录含 leader 的 PID、PGID 与启动时间令牌（均由 `procinfo.process_identity()` 获取，决定 6）。新实例启动时扫描 `sessions/`：owner 身份仍匹配或无法确认的文件跳过；确定 owner 已不存在的文件先取 `fcntl.flock` 排他锁（取不到则跳过），对每条记录再取 `process_identity(leader_pid)`，PID、PGID、启动时间令牌三者都匹配才对 PGID 发 HUP/TERM→KILL；确定不存在则不发信号；无法确认则不发信号并保留该文件留待下次。已处理的记录并入新实例内存中的 `lost` 列表（可 `terminal_list(include_exited=true)` 查询 600 秒后 GC），并删除原文件；新实例不恢复 I/O 或接管。实例正常退出时在杀完全部会话后删除自己的文件。清扫在持锁后校验 inode 防止双实例读取已被另一清扫者删除的旧文件；先预检同一文件全部 leader，任何无法确认均保留整文件，不部分导入。每次非零信号（含升级 KILL）前重新核对完整身份；组存在性探测出现短暂 EPERM 时按仍未证实消失进行有界等待，仍无法确认则保留文件。lost 记录先写入新实例快照，成功后才删除源文件；lost 的 GC/shutdown 不发信号。
 
 #### 横切质量设计
 
@@ -319,12 +329,12 @@ pattern = "rm\\s+[^\\n]*-rf[^\\n]*\\s/(?:\\s|$)"
 - **cwd**：配置的每个 root 和请求 cwd 都先 `Path.resolve(strict=True)`；以 `os.path.commonpath([cwd, root]) == root` 判断包含关系，拒绝符号链接逃逸、相对路径转义、不存在路径和非目录。
 - **环境**：继承环境先按不区分大小写的 glob denylist 剥离，再叠加调用 `env`，最后再次剥离。调用方显式提供命中敏感模式的键会得到 `POLICY_DENIED`，不会静默注入。只保留值不含 NUL、键合法、总量受限的环境。TOML `env_deny_patterns` 与内置模式取并集，危险命令自定义规则也只追加，不允许借空列表/替换规则删除默认保护；这落实“本地配置只能收紧”的默认边界。
 - **命令**：启动命令和写入的每个完整逻辑行都按预编译规则检查；默认规则 ID 为 `rm-root`、`mkfs`、`dd-device`、`power-control`、`fork-bomb`、`download-shell`，分别覆盖 `rm -rf /`、`mkfs`、`dd ... of=/dev/...`、`shutdown`/`reboot`/`halt`/`poweroff`、经典 fork bomb、`curl|sh`/`wget|sh`。`terminal_write` 维护每会话的未完成行：跨调用拼接后才检查；CRLF 视为一次提交，Backspace 删除一个字符，C-c 清空待提交行；Enter 会检查当前未完成行且规则命中时不发送 Enter。一次 write 内任一完整行被拒绝时，整个 write 原子拒绝且 tracker 不变，避免前一行已执行而后一行失败。未提交输入最多 65,536 UTF-8 字节（`input-line-limit`）；tracker 与实际写操作须受同一会话写锁保护，写失败由 T02 停止继续写或恢复到实际送出的状态；不模拟箭头键/交互编辑器。
-- **审计**：审计文件为 state 目录下 `audit.jsonl`，每次 Tool 调用和策略判定追加一行，字段为 `timestamp`、`tool`、`session_id`、`command`（start 命令或被检查的完整 write 行；其他 Tool 为 `null`）、`cwd`、`mode`、`parameter_summary`、`policy:{decision,rule_id}`、`result:{status,exit_code,signal,error_code}`、`duration_ms`。不写 `output`、`stdout`、`stderr` 或环境变量值。审计文件本身可能包含命令文本，必须按本机敏感日志保护，不能提交到 Git。
+- **审计**：审计文件为 state 目录下 `audit.jsonl`，每次 Tool 调用和策略判定追加一行，字段为 `timestamp`、`tool`、`session_id`、`command`（start 命令或被检查的完整 write 行；其他 Tool 为 `null`）、`cwd`、`mode`、`parameter_summary`、`policy:{decision,rule_id}`、`result:{status,exit_code,signal,error_code}`、`duration_ms`。不写 `output`、`stdout`、`stderr` 或环境变量值。审计文件本身可能包含命令文本，必须按本机敏感日志保护，不能提交到 Git。T04 使用调用前 pending 行、每次规则 allow/deny/filter 行及调用完成行；取消等待记录 `CANCELLED` 后继续向 SDK 传播取消，完整 write 行之外不记录输入正文。所有事件按当前请求 ContextVar 关联，避免并发串话；状态结果行保留退出码/信号/稳定错误码。
 - **诚实限制**：这是防 Agent 误操作和意外泄密的 best-effort guardrail，不是 OS sandbox，也不能防止当前用户、shell 转义/编码、已允许程序的二次下载、交互式编辑器动作或故意规避规则。服务以当前用户权限执行；MVP 不实施 elicitation 审批，命中规则一律拒绝。
 
 ##### 可靠性、性能与观测
 
-每会话分别使用写锁与输出条件，故并发读取不互相推进 cursor，写入按进入 manager 的顺序串行；等待中的会话不持有全局锁。环形缓冲、每次读取 1 MiB 上限、读端 drain 和 16 会话上限形成容量边界。audit 写失败或 registry 写失败是 `INTERNAL_ERROR` 且拒绝可能无法可靠清理的新启动，不静默降级。运行时日志仅记录错误码/ID；发布前检查 `.gitignore` 和 `git status`，确保审计、state、config 本机路径和任何密钥不进入公开仓库。
+每会话分别使用写锁与输出条件，故并发读取不互相推进 cursor，写入按进入 manager 的顺序串行；等待中的会话不持有全局锁。环形缓冲、每次读取 1 MiB 上限、读端 drain 和 16 会话上限形成容量边界。audit 写失败或 registry 写失败是 `INTERNAL_ERROR` 且锁存故障，直到用户修复 state 目录并重启前都拒绝新启动，不静默降级。start 在 spawn 前验证注册表可写，spawn 后采集并保存原生身份；后置写入/身份探测失败则立即 KILL 并 reap 该新进程后报错。后台退出/GC 写失败同样锁存，在后续 Tool 边界报告 INTERNAL_ERROR。持久化故障不阻断已有会话的显式 kill 与 EOF/shutdown 回收；kill 仍清理进程，但因审计/持久化未成功而返回 INTERNAL_ERROR。运行时日志仅记录错误码/ID；发布前检查 `.gitignore` 和 `git status`，确保审计、state、config 本机路径和任何密钥不进入公开仓库。
 
 #### 风险与取舍
 
@@ -333,7 +343,7 @@ pattern = "rm\\s+[^\\n]*-rf[^\\n]*\\s/(?:\\s|$)"
 | SDK v2 与旧客户端实现的兼容差异 | stdio handshake、schema 或取消行为不同。 | 锁定 `mcp==2.3.0`，用官方 `ClientSession` 做真实 stdio 契约测试；验证阶段再以 Manus 实测，不把 v1 API 当作可用。 |
 | PTY 的 EOF、后台子进程和 job-control 行为在 macOS/Linux 有差异 | 可能遗留进程或读取无法结束。 | 用 `pty.fork()`、明确 PGID、`killpg` 与 reap；为父退出/后台持有 PTY、EOF 清理和 Linux/macOS分别计划集成测试。 |
 | Python regex 的复杂模式可消耗 CPU | `until` 可能降低服务响应性。 | 长度限制 1,024；只在本会话输出更新时评估；在文档说明只给简单 prompt/标记 regex。MVP 不承诺正则执行超时。 |
-| 基于 `ps lstart` 的重启识别只能保守判断 | 启动时刻不匹配或查不到时不能安全杀组，旧记录会 `lost`。 | PID、PGID、lstart 三重匹配才 kill；记录 `lost` 与审计，绝不冒险杀疑似 PID 复用进程。后续 daemon 可做更强所有权。 |
+| 基于启动时间令牌的重启识别只能保守判断 | 启动时刻不匹配或查不到时不能安全杀组，旧记录会 `lost`。 | PID、PGID、启动时间令牌三重匹配才 kill，无法确认时不发信号；记录 `lost` 与审计，绝不冒险杀疑似 PID 复用进程。后续 daemon 可做更强所有权。 |
 | 多个客户端同时启动服务实例 | 共用注册表会导致新实例误杀活实例的会话，或并发覆盖写。 | 决定 4：按实例分文件 + owner 存活检查 + `flock`；`test_restart.py` 覆盖“活实例的会话不被另一实例清扫”。 |
 | 有线程时 `fork` | Python 3.12 对多线程进程 fork 给出 DeprecationWarning，子进程若执行 Python 逻辑可能死锁。 | 子进程只做 `chdir`/`ioctl`/`execvpe`/`_exit`；该警告视为已知并记录，测试不得出现挂起。 |
 | 仅本机 macOS 实测 | Linux 兼容性（CON-001）缺少证据。 | T05 增加 GitHub Actions CI（`ubuntu-latest` 与 `macos-latest` 运行全部测试）；推送后以 CI 结果作为 Linux 证据，CI 不可用时在验证记录中注明缺口。 |
@@ -420,7 +430,7 @@ T03 的共享 fixture 同时显式传入临时 `--state-dir`、`--allowed-root` 
 | US2-1：增量游标 | `tests/integration/test_mcp_stdio.py::test_incremental_read_has_no_duplicate_or_gap` | 多次 `next_cursor` 无重复遗漏、运行中。 |
 | US2-2：等待不阻塞另一会话 | `tests/integration/test_mcp_stdio.py::test_waiting_read_does_not_block_other_write` | 10 秒 read 期间另一会话 write 在短阈值内完成。 |
 | US2-3：缓冲覆盖 | `tests/unit/test_buffer.py::test_old_cursor_reports_dropped_bytes` 与 stdio 回归 | `dropped_bytes>0`、只留最新、占用不超容量。 |
-| US2-4：会话 timeout | `tests/integration/test_lifecycle.py::test_timeout_kills_group` | 2 秒 timeout 后 `timed_out` 且组消失。 |
+| US2-4：会话 timeout | `tests/integration/test_lifecycle.py::test_stdio_two_second_timeout`（并有 PTY/pipe 核心测试） | 2 秒 timeout 后 `timed_out` 且组消失。 |
 | US3-1：Python REPL + Enter/until | `tests/integration/test_mcp_stdio.py::test_repl_write_and_until_prompt` | 输出有 42，`>>> ` 无换行也能匹配。 |
 | US3-2：C-c 中断前台 sleep | `tests/integration/test_mcp_stdio.py::test_ctrl_c_keeps_shell_running` | sleep 结束，shell `running` 并重新出现提示。 |
 | US3-3：PTY TTY 检测 | `tests/integration/test_mcp_stdio.py::test_pty_has_controlling_tty` | `test -t 1` 成功。 |
@@ -449,8 +459,8 @@ T03 的共享 fixture 同时显式传入临时 `--state-dir`、`--allowed-root` 
 
 - **SC-001**：上表 US1 至 US7 的所有测试属于默认 `pytest -q` 收集集；没有 `xfail` 或跳过，测试报告逐行对应表中 30 项。
 - **SC-003**：`test_wait_latency_under_200ms` 令子进程输出其 `time.monotonic_ns()`，等待 read 收到后记录 client `monotonic_ns()`；在正常 macOS/Linux 测试机断言差值 `<200 ms`，并保存失败时的实际延迟。
-- **SC-004**：`test_kill_reaps_whole_process_group` 和 `test_stdio_eof_reaps_all_groups` 以 20 ms 轮询 `ps -p <child-pid>`，从 kill/EOF 计时起断言 2 秒内无目标 PID；还断言 server process 已退出或 session 已 reaped。
-- **SC-005**：`test_50mb_output_is_bounded` 以唯一临时 `--config` 路径识别真实 server PID，50 MB 写入期间每 20 ms 用 `ps -o rss= -p <pid>` 采样。与任务开始前 idle RSS 比较，断言峰值增量 `<= 3 * buffer_bytes`（3 MiB 默认），并检查 buffer 的 retained bytes `<=1 MiB`；该测试只在 macOS/Linux 执行。
+- **SC-004**：`test_kill_reaps_whole_process_group` 和 `test_stdio_eof_reaps_all_groups` 以 20 ms 轮询 `procinfo.process_identity(<child-pid>)`（或对测试自建 PID 的 `os.kill(pid, 0)`），从 kill/EOF 计时起断言 2 秒内无目标 PID；还断言 server process 已退出或 session 已 reaped。
+- **SC-005**：`test_50mb_output_is_bounded` 由官方 stdio 测试 harness 获取其创建的 server PID，并与临时实例注册表文件名互证；50 MB 写入期间每 20 ms 用 `procinfo.process_rss(<pid>)` 采样（server PID 取自测试启动的子进程句柄）。与任务开始前 idle RSS 比较，断言峰值增量 `<= 3 * buffer_bytes`（3 MiB 默认），并检查 buffer 的 retained bytes `<=1 MiB`；该测试只在 macOS/Linux 执行。
 - **SC-002 / US8**：不自动化替代真实客户端。主 Agent 在 validate 阶段按 README 把 stdio command 注册到 Manus，让 Agent 仅看 Tool 描述完成 `python3 -i`、表达式、读取、终止；记录原始 Tool 调用、无参数错误重试的结果与环境。当前 Task 只交付此验证所需文档。
 
 实现者每一 Task 至少执行其相关测试，并在最终执行：
@@ -518,9 +528,9 @@ UV_CACHE_DIR=.work/uv-cache uv run terminal-mcp --help
 ##### 阶段 4：故事 4、6、7 与容量可靠性
 
 4. **FEAT-001-T04 — 完成连接关闭、重启清扫、安全审计和性能边界**
-   - **代码范围**：`src/terminal_mcp/session.py`、`src/terminal_mcp/server.py`、`src/terminal_mcp/policy.py`、`src/terminal_mcp/audit.py`、`src/terminal_mcp/registry.py`、`tests/integration/test_lifecycle.py`、`tests/integration/test_policy_audit.py`、`tests/integration/test_restart.py`、`tests/integration/test_capacity.py`。
+   - **代码范围**：`src/terminal_mcp/procinfo.py`、`src/terminal_mcp/session.py`、`src/terminal_mcp/server.py`、`src/terminal_mcp/policy.py`、`src/terminal_mcp/audit.py`、`src/terminal_mcp/registry.py`、`tests/unit/test_procinfo.py`、`tests/integration/test_lifecycle.py`、`tests/integration/test_policy_audit.py`、`tests/integration/test_restart.py`、`tests/integration/test_capacity.py`。
    - **依赖**：`FEAT-001-T03`。
-   - **完成条件**：lifespan EOF shutdown、按实例分文件且检查 owner 存活与 PID/PGID/lstart 的 restart sweep（含多实例并存不误杀）、`lost` 查询、审计字段、安全拒绝、SC-003 读延迟、SC-004 两秒清理和 SC-005 50 MB RSS/缓冲边界均被可重复测试覆盖。
+   - **完成条件**：lifespan EOF shutdown、按实例分文件且检查 owner 存活与 PID/PGID/启动时间令牌的 restart sweep（`procinfo.py`，决定 6）（含多实例并存不误杀）、`lost` 查询、审计字段、安全拒绝、SC-003 读延迟、SC-004 两秒清理和 SC-005 50 MB RSS/缓冲边界均被可重复测试覆盖。
    - **验证**：先写失败的 US4/US6/US7、八个边界和 SC 测试，再执行 `UV_CACHE_DIR=.work/uv-cache uv run pytest -q tests/integration/test_lifecycle.py tests/integration/test_policy_audit.py tests/integration/test_restart.py tests/integration/test_capacity.py`。
 
 ##### 阶段 5：全局使用入口与最终收尾
@@ -557,6 +567,8 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form；Claude Code 使用
 - **FEAT-001-T02（实现完成，待主 Agent 验收）**：新增 `src/terminal_mcp/session.py` 与 `tests/integration/test_session_core.py`、`test_lifecycle.py`，最小扩展 `buffer.py` 的 raw_text/revision；实现真实 PTY/pipe、新 session/进程组、尺寸/TERM、partial write/EAGAIN、写锁、五种等待原因、取消隔离、timeout/信号升级、leader reap 与流 EOF 分离、自然退出清理、600 秒保留/GC 和并行 shutdown_all。首次 RED：两测试模块因缺 session 模块而收集失败（exit 2）；补充 RED 分别锁定自然退出未完成清理（2 failed）、EOF 的 U+FFFD 未重匹配（2 failed）与 macOS 瞬时 EPERM 清理（1 failed + teardown error）。修复后设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp`，执行 `uv run --offline pytest -q tests/unit tests/integration/test_session_core.py tests/integration/test_lifecycle.py` 得 **159 passed**（7.95 s，exit 0），随后两个集成文件连续复跑两次均 **42 passed**（7.57/7.79 s）；`uv lock --locked --offline` 为 exit 0（37 packages），无新增依赖。测试只使用临时 config/state/cwd/HOME 和自己创建的 PID，断言 kill/shutdown 后 2 秒内 PID 消失；自然退出、父退出后后台持有 PTY/pipe、TERM 忽略、立即 kill、取消 read/write/kill wait、控制 TTY/C-c、REPL、上下文隔离/上限、GC、fork/exec 失败均覆盖。最初一次运行因 stdlib pyc 写到仓库外被拒，后续禁用 bytecode；本机自建 shell 可执行文件冷启动有延迟，登录参数测试使用有界 5 秒等待。仅交付内部会话核心，README 按原计划留给 T05，MCP/EOF 接线、restart/audit、Linux CI 与完整成功标准分别由 T03/T04/T05 后续验证；未修改或提交 state.json。
 
 - **FEAT-001-T03（实现完成，待主 Agent 验收）**：新增 `src/terminal_mcp/server.py`，接通 `__main__.py` 的真实 stdio CLI，扩展 `tests/conftest.py` 并新增 `tests/integration/test_mcp_stdio.py`；按已安装 mcp 2.3.0 源码使用构造式 handler 注册、SDK 消息流和 lifespan context，只发布 contracts.py 的五 Tool/schema/英文描述。成功返回 structuredContent 与有界短文本，预期业务错误返回 isError/error/code/message/hint 及同文摘要，内部异常脱敏；每次分派前校验参数，lifespan 在正常、异常、取消退出时均等待 shutdown_all。首次 RED：`uv run --offline pytest -q tests/integration/test_mcp_stdio.py --tb=short` 得 **3 failed, 40 errors**（2.14 s，exit 1），确认原因是 CLI 尚为占位实现而关闭握手连接及缺失 server 模块；实现后同命令得 **43 passed**（13.56 s），首次全量 **202 passed**（23.05 s）。补充 START_FAILED 保留身份、INTERNAL_ERROR 脱敏、取消 lifespan 三个测试并移除未使用的 fixture 开关后，设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 运行 `uv run --offline pytest -q` 得 **205 passed**（23.38 s，exit 0）；`uv lock --locked --offline`（37 packages）、`uv run --offline terminal-mcp --help`、`git diff --check` 均 exit 0。真实 stdio 覆盖 US1-1~3、US2-1~3、US3-1~3、US4-4、US5-1~2 与边界 3/5/6/7，另验证 pipe 分流、取消 read 不杀进程、终态 kill/remove 和所有 Tool 的结构化参数错误。无需修改 contracts.py/session.py，无新依赖、网络、真实用户 state 目录或 lifecycle 写入；审计/重启/真实 EOF 成功标准、README/Linux CI/Manus 实测分别留给 T04/T05/validate。
+
+- **FEAT-001-T04（实现完成，待主 Agent 验收）**：按决定 6 新增标准库原生 `procinfo.py`（macOS libproc / Linux procfs），统一 `owner_start_time`/`leader_start_time`；完成按实例注册表、状态变更原子持久化、flock/inode/owner/leader 三元身份保守清扫、SIGKILL 重启遗留组回收、600 秒 lost/SESSION_LOST、审计与策略回调、故障锁存和 EOF 删除实例文件。复审并更新前次测试草稿；本次原生模块 RED 为 **4 个收集错误**（exit 2），接线 RED 为 **2 failed**；原生单测先行 **8 passed**，首轮专项 **34 passed**。首次全量 **6 failed, 226 passed**（旧注册表参数和 T03 mock 接口未更新），以最小改动调整 `tests/unit/test_policy.py`、`test_audit_registry.py`、`tests/integration/test_mcp_stdio.py`；加强多进程重启测试后发现 macOS 短暂组探测 EPERM（**1 failed, 237 passed**），新增确定性 RED 后修复为有界等待；另新增审计失败不应阻止显式 kill 的 RED 后修复。所有运行设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 且使用 `uv run --offline`。最终未再改代码的两次完整 `pytest -q` 均 **240 passed**（46.72 s / 34.92 s，exit 0）；日志为 `.work/t04-full-green-1.log`、`.work/t04-full-green-2.log`，此前 RED 与专项日志同在忽略目录 `.work/`。专项测得 wait 延迟 **19.291 ms**、50 MB 输出 RSS 增长 **1,654,784 bytes**（小于 3 MiB）、突发期间最大 list 延迟 **2.213 ms**，retained bytes 始终不超过 1 MiB；两次最终全量也执行相同严格性能断言。US4-3、US6-1~4、US7-1、US2-4、边界 1/2/4/8 与 SC-003/004/005 均覆盖；原生身份测试含 self、child、exited child、pid 1、ABI/错误返回和 Linux stat 尾括号解析。未调用受禁进程命令、未联网、未添加依赖、未写真实用户 state/config/HOME、未修改或提交 state.json；README/CI 仍按计划留给 T05，Linux 真机与 Manus US8 验证仍由后续阶段完成。
 
 ## 验证记录（实际）
 

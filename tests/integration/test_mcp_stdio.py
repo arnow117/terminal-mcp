@@ -343,11 +343,14 @@ async def test_start_failure_retains_structured_identity(mcp_client, tmp_path):
     assert result["sessions"][0]["pid"] is None
 
 
-async def test_unexpected_failure_is_structured_without_details(caplog):
+async def test_unexpected_failure_is_structured_without_details(caplog, config):
     from mcp import types
     from terminal_mcp.server import AppContext, on_call_tool
 
-    manager = SimpleNamespace(list=AsyncMock(side_effect=RuntimeError("private-exception-payload")))
+    from terminal_mcp.session import SessionManager
+
+    manager = SessionManager(config)
+    manager.list = AsyncMock(side_effect=RuntimeError("private-exception-payload"))
     context = SimpleNamespace(lifespan_context=AppContext(manager=manager))
     result = await on_call_tool(context, types.CallToolRequestParams(name="terminal_list", arguments={}))
     assert result.is_error
@@ -368,6 +371,7 @@ async def test_cancelled_lifespan_finishes_shutdown(config):
         finished.set()
 
     with patch("terminal_mcp.server.SessionManager") as manager_type:
+        manager_type.return_value.initialize = AsyncMock()
         manager_type.return_value.shutdown_all = AsyncMock(side_effect=shutdown)
         server = create_server(config)
         with anyio.CancelScope() as scope:
@@ -384,6 +388,7 @@ async def test_lifespan_always_shuts_down_manager(config, raise_in_lifespan):
 
     with patch("terminal_mcp.server.SessionManager") as manager_type:
         manager = manager_type.return_value
+        manager.initialize = AsyncMock()
         manager.shutdown_all = AsyncMock()
         server = create_server(config)
         try:

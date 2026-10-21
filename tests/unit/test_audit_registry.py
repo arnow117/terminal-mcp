@@ -36,7 +36,7 @@ def test_audit_short_write_fails_without_a_second_write(tmp_path, monkeypatch):
 
 
 def test_registry_failure_is_safe_and_private(tmp_path, monkeypatch):
-    registry = Registry(tmp_path, owner_pid=123, owner_lstart=" start ", instance_id="one")
+    registry = Registry(tmp_path, owner_pid=123, owner_start_time=" start ", instance_id="one")
     registry.write([])
     previous = registry.path.read_bytes()
     assert registry.path.stat().st_mode & 0o777 == 0o600
@@ -52,7 +52,7 @@ def test_registry_failure_is_safe_and_private(tmp_path, monkeypatch):
     assert list(registry.path.parent.glob("*.tmp")) == []
 
 
-@pytest.mark.parametrize("snapshot", [{}, {"owner_pid": 1, "owner_lstart": "", "records": []}, {"owner_pid": True, "owner_lstart": "start", "records": []}, {"owner_pid": 123, "owner_lstart": "start", "records": [{}]}])
+@pytest.mark.parametrize("snapshot", [{}, {"owner_pid": 1, "owner_start_time": "", "records": []}, {"owner_pid": True, "owner_start_time": "start", "records": []}, {"owner_pid": 123, "owner_start_time": "start", "records": [{}]}])
 def test_registry_load_rejects_malformed_records(tmp_path, snapshot):
     path = tmp_path / "registry.json"
     path.write_text(json.dumps(snapshot))
@@ -61,7 +61,7 @@ def test_registry_load_rejects_malformed_records(tmp_path, snapshot):
 
 
 def test_matching_never_accepts_empty_identity_or_process_group_zero():
-    assert not owner_is_live({"owner_pid": 123, "owner_lstart": ""}, 123, "")
+    assert not owner_is_live({"owner_pid": 123, "owner_start_time": ""}, 123, "")
     record = RegistryRecord("s", 123, 123, "start", "2026-10-21T10:00:00Z", "running")
     assert record_matches_process(record, 123, 123, " start\n")
     assert not record_matches_process(record, 123, 0, "start")
@@ -70,4 +70,4 @@ def test_matching_never_accepts_empty_identity_or_process_group_zero():
 
 def test_registry_instance_identifier_cannot_escape_directory(tmp_path):
     with pytest.raises(ValueError):
-        Registry(tmp_path, owner_pid=123, owner_lstart="start", instance_id="../../escape")
+        Registry(tmp_path, owner_pid=123, owner_start_time="start", instance_id="../../escape")

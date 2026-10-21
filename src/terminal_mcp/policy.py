@@ -29,9 +29,14 @@ class CompleteLineTracker:
 
 
 class Policy:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, on_decision=None):
         self.config = config
         self.rules = tuple((rule_id, re.compile(pattern)) for rule_id, pattern in config.dangerous_command_rules)
+        self.on_decision = on_decision
+
+    def _decision(self, decision: str, rule_id: str | None, command: str | None = None):
+        if self.on_decision is not None:
+            self.on_decision(decision, rule_id, command)
 
     def _denied_env(self, name: str) -> bool:
         return any(fnmatchcase(name.upper(), pattern.upper()) for pattern in self.config.env_deny_patterns)
@@ -39,14 +44,18 @@ class Policy:
     def check_command(self, command: str) -> None:
         for rule_id, pattern in self.rules:
             if pattern.search(command):
+                self._decision("deny", rule_id, command)
                 raise ToolError("POLICY_DENIED", f"Command denied by rule {rule_id}.", rule_id=rule_id)
+        self._decision("allow", "command", command)
 
     def prepare_start(self, *, command: str | None = None, cwd: str | Path | None = None,
                       env: dict[str, str] | None = None, timeout_s: int | None = None,
                       environ: Mapping[str, str] | None = None) -> PreparedStart:
         cwd = resolve_directory(self.config.startup_cwd if cwd is None else cwd, base=self.config.startup_cwd)
         if not any(os.path.commonpath((cwd, root)) == str(root) for root in self.config.allowed_roots):
+            self._decision("deny", "cwd-outside-roots")
             raise ToolError("POLICY_DENIED", "cwd denied by rule cwd-outside-roots.", rule_id="cwd-outside-roots")
+        self._decision("allow", "cwd-inside-roots")
         if command is not None:
             if not isinstance(command, str) or not command:
                 raise ToolError("INVALID_ARGUMENT", "command must be null or a nonempty string.")
@@ -56,11 +65,15 @@ class Policy:
         validate_environment(explicit)
         for name in explicit:
             if self._denied_env(name):
+                self._decision("deny", "sensitive-env")
                 raise ToolError("POLICY_DENIED", "Explicit environment name denied by rule sensitive-env.", rule_id="sensitive-env")
         prepared_env = dict(explicit)
         total = sum(len(name.encode()) + len(value.encode()) for name, value in explicit.items())
         for name, value in (os.environ if environ is None else environ).items():
-            if name in prepared_env or self._denied_env(name):
+            if self._denied_env(name):
+                self._decision("filter", "sensitive-env")
+                continue
+            if name in prepared_env:
                 continue
             try:
                 validate_environment({name: value})
@@ -114,6 +127,7 @@ class Policy:
             else:
                 pending_size += len(char.encode())
                 if pending_size > 65536:
+                    self._decision("deny", "input-line-limit")
                     raise ToolError("POLICY_DENIED", "Unsubmitted input denied by rule input-line-limit (65536 bytes).", rule_id="input-line-limit")
                 pending.append(char)
         tracker.pending = "".join(pending)

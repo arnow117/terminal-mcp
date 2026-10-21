@@ -174,9 +174,9 @@ def test_audit_single_append_write_and_no_sensitive_bodies(tmp_path, monkeypatch
 
 
 def test_registry_atomic_instance_files_and_pure_matching(tmp_path, monkeypatch):
-    first = Registry(tmp_path, owner_pid=100, owner_lstart="Wed Oct 21 10:00:00 2026", instance_id="one")
-    second = Registry(tmp_path, owner_pid=101, owner_lstart="Wed Oct 21 10:00:01 2026", instance_id="two")
-    record = RegistryRecord(session_id="s", leader_pid=200, pgid=200, leader_lstart="Wed Oct 21 10:01:00 2026", started_at="2026-10-21T10:01:00Z", status="running")
+    first = Registry(tmp_path, owner_pid=100, owner_start_time="Wed Oct 21 10:00:00 2026", instance_id="one")
+    second = Registry(tmp_path, owner_pid=101, owner_start_time="Wed Oct 21 10:00:01 2026", instance_id="two")
+    record = RegistryRecord(session_id="s", leader_pid=200, pgid=200, leader_start_time="Wed Oct 21 10:01:00 2026", started_at="2026-10-21T10:01:00Z", status="running")
     calls = []
     real_fsync, real_replace = os.fsync, os.replace
     monkeypatch.setattr(os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
@@ -193,14 +193,14 @@ def test_registry_atomic_instance_files_and_pure_matching(tmp_path, monkeypatch)
     assert owner_is_live(loaded, 100, "  Wed Oct 21 10:00:00 2026\n")
     assert not owner_is_live(loaded, None, None)
     assert not owner_is_live(loaded, 100, "different")
-    assert record_matches_process(record, 200, 200, record.leader_lstart)
-    for pid, pgid, start in [(201, 200, record.leader_lstart), (200, 201, record.leader_lstart), (200, 200, "different"), (None, None, None)]:
+    assert record_matches_process(record, 200, 200, record.leader_start_time)
+    for pid, pgid, start in [(201, 200, record.leader_start_time), (200, 201, record.leader_start_time), (200, 200, "different"), (None, None, None)]:
         assert not record_matches_process(record, pid, pgid, start)
     assert list((tmp_path / "sessions").glob("*.tmp")) == []
 
 
 def test_registry_failed_replace_preserves_previous_snapshot(tmp_path, monkeypatch):
-    registry = Registry(tmp_path, owner_pid=100, owner_lstart="start", instance_id="one")
+    registry = Registry(tmp_path, owner_pid=100, owner_start_time="start", instance_id="one")
     registry.write([])
     previous = registry.path.read_bytes()
 
