@@ -66,12 +66,12 @@
             "FEAT-001-T05"
           ],
           "id": "FEAT-001-T06",
-          "status": "in_progress",
+          "status": "done",
           "title": "修复会话全成员清理与 spawn 竞态，加固审计权限与 CI 供应链",
-          "updated_at": "2026-10-21T14:00:45Z"
+          "updated_at": "2026-10-21T14:23:51Z"
         }
       },
-      "updated_at": "2026-10-21T14:00:45Z",
+      "updated_at": "2026-10-21T14:23:51Z",
       "validation": {
         "at": null,
         "command": null,
@@ -92,7 +92,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
       "status": "in_delivery",
       "title": "Agent 可用的终端会话 MCP Server（MVP）",
-      "updated_at": "2026-10-21T14:00:45Z"
+      "updated_at": "2026-10-21T14:23:51Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
