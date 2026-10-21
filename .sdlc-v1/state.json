@@ -1,0 +1,20 @@
+{
+  "features": {},
+  "requirements": {
+    "REQ-001": {
+      "created_at": "2026-10-21T11:19:14Z",
+      "depends_on": [],
+      "description": "MCP Server 让客户端/Agent 创建并控制本地终端会话：启动、增量读取、交互写入、状态、终止；含生命周期清理与安全边界",
+      "domain": "terminal-mcp",
+      "feature_id": null,
+      "id": "REQ-001",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
+      "status": "ready",
+      "title": "Agent 可用的终端会话 MCP Server（MVP）",
+      "updated_at": "2026-10-21T11:24:11Z"
+    }
+  },
+  "state_format": "sdlc-lightweight-state-v1",
+  "state_version": 3
+}
