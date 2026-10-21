@@ -58,18 +58,18 @@ session.py: SessionManager ─── registry.py
 ##### `session.py`：`Session` 与 `SessionManager`
 
 - **职责**：拥有进程句柄/PTY FD、PID/PGID、状态、并发写锁、timeout task、退出信息和输出通知；创建两个后端，串行化同一会话写入，维护 16 会话限制，负责整组信号、reap、保留和 GC。
-- **接口**：`start`、`read`、`write`、`list`、`kill`、`shutdown_all`；调用者绝不直接操作 `Popen`/FD。
+- **接口**：`SessionManager(config)`，六个入口均为 async：`start(**tool_arguments)`、`read(session_id, cursor, **options)`、`write(session_id, **options)`、`list(session_id=None, include_exited=True)`、`kill(session_id, **options)`、`shutdown_all()`；成功返回与 `contracts.py` 对应的普通 dict，业务错误抛 `ToolError`。Manager 复用参数校验和 `Policy`，完整行 tracker 与实际 write 共用写锁；取消/失败的部分写入后禁用该会话后续写入，避免 tracker 与已发送内容失配。调用者绝不直接操作 `Popen`/FD；T03 负责 MCP 分派，T04 负责审计/注册表接线。
 - **覆盖**：`REQ-F01` 至 `REQ-F05`。
 
 ##### `buffer.py`：有界原始字节输出缓冲
 
 - **职责**：保存带 `stream`（`pty`/`stdout`/`stderr`）标签的原始字节区段和单调递增绝对偏移；按 1 MiB 上限逐段淘汰；从游标产生 UTF-8 安全文本、`dropped_bytes`、`next_cursor`、`has_more`。纯缓冲不拥有异步任务；T02 的 `Session` 在 append/close 后通知自己的长轮询条件。
-- **接口**：`OutputBuffer(capacity_bytes=1048576, mode="pty")`、`append(stream, bytes)`、`read(cursor, max_bytes=65536, strip_ansi=True) -> OutputPage`、`close_stream(stream)`；`OutputPage` 是不可变 dataclass，含 `output/stdout/stderr/next_cursor/dropped_bytes/has_more`。等待和退出状态由会话层组合。
+- **接口**：`OutputBuffer(capacity_bytes=1048576, mode="pty")`、`append(stream, bytes)`、`read(cursor, max_bytes=65536, strip_ansi=True) -> OutputPage`、`close_stream(stream)`；`OutputPage` 是不可变 dataclass，含 `output/stdout/stderr/next_cursor/dropped_bytes/has_more`。T02 增加 `raw_text(cursor)`（按到达顺序、各流独立解码、未剥离 ANSI 的有界等待窗口）与 `revision`（append 和首次 EOF 都递增），保证 EOF 刷出的 U+FFFD 同样触发 until 匹配。等待和退出状态由会话层组合。
 - **覆盖**：`REQ-F02`、`REQ-F04`、`REQ-F06`。
 
 ##### PTY/pipe 后端（`session.py` 内的两个小启动路径）
 
-- **职责**：PTY 路径通过 `pty.fork()` 创建新 session、进程组和 controlling TTY，再以 `execvpe` 执行 `$SHELL -l` 或 `/bin/sh -c <command>`；pipe 路径以 `asyncio.create_subprocess_shell(..., start_new_session=True)` 分别 drain stdout/stderr。两者都以非阻塞回调/任务写入同一缓冲并持续 reap。
+- **职责**：PTY 路径通过 `pty.fork()` 创建新 session、进程组和 controlling TTY，再以 `execvpe` 执行 `$SHELL -l` 或 `/bin/sh -c <command>`；pipe 路径以 `asyncio.create_subprocess_exec(*argv, start_new_session=True)` 分别 drain stdout/stderr，argv 同样显式为 `/bin/sh -c <command>` 或 `$SHELL -l`，避免默认 shell 路径被二次 shell 解释。两者都以非阻塞回调/任务写入同一缓冲并持续 reap。
 - **接口**：向 `Session` 提供异步 `write_all`、`poll`、`close_streams`；PTY 写入处理 partial write/EAGAIN，不能阻塞事件循环。
 - **覆盖**：`REQ-F01`、`REQ-F02`、`REQ-F03`、`REQ-F05`。
 
@@ -284,11 +284,11 @@ src/terminal_mcp/
 - **绝对游标**：每次后端读取到原始 byte 都分配连续的会话内 `[start,end)` 偏移。`cursor` 是绝对偏移，`next_cursor` 是本次成功返回的最后一个完整 UTF-8 字符之后的原始偏移，不能把显示字符串长度当作 cursor。
 - **淘汰**：容量为 1 MiB。若 `cursor < output_start_cursor`，从当前最早保留字节开始读，`dropped_bytes=output_start_cursor-cursor`；它只计被环淘汰的原始字节，绝不把 ANSI 去除字节计入。`has_more` 表示 `next_cursor < output_end_cursor`。
 - **编码**：缓冲永远存原始 bytes。读窗口在 UTF-8 字符边界截断；不足一个有效字节序列的尾部留给下一次，避免拆分多字节字符。非法序列用 U+FFFD 替换，并继续处理后续字节。pipe 的 stdout/stderr 按各自流的字节顺序独立增量解码，保持同一个全局 cursor；读窗口回退到对所有流都安全的公共边界，不返回该边界之后的其他流正文以免重复。`max_bytes` 最小为 4，足够容纳一个连续 UTF-8 字符；跨流交错字符尚未完成或超出本次全局窗口时仍须等待/扩大读取窗口。后端 EOF 必须调用 `close_stream`，将该流最后不完整序列输出为 U+FFFD。
-- **ANSI**：默认在解码后跨 chunk/分页去除 ANSI CSI/OSC 序列，并把 `\r\n` 规范为 `\n`；stripped 模式暂缓消费未关闭流末尾的单独 CR，直到后续字符或 EOF，以保证跨页 CRLF 正确且不折叠其他 CR。`strip_ansi=false` 才显示原序列与原换行。只保存淘汰起点的有限 ANSI 解析状态，不保留 OSC 正文；从同一 cursor 重读不改变其他读取者的结果。原始段按最多 8 KiB 合并，大 append 的已淘汰前缀同样分块处理，不分配与总输出量同大的临时副本。匹配 `until` 使用未去除 ANSI 的解码文本，避免展示选项改变控制语义；`until` 只在本次调用起始游标之后、且不超过缓冲保留范围的文本上增量匹配，避免海量输出时重复全量扫描。
+- **ANSI**：默认在解码后跨 chunk/分页去除 ANSI CSI/OSC 序列，并把 `\r\n` 规范为 `\n`；stripped 模式暂缓消费未关闭流末尾的单独 CR，直到后续字符或 EOF，以保证跨页 CRLF 正确且不折叠其他 CR。`strip_ansi=false` 才显示原序列与原换行。只保存淘汰起点的有限 ANSI 解析状态，不保留 OSC 正文；从同一 cursor 重读不改变其他读取者的结果。原始段按最多 8 KiB 合并，大 append 的已淘汰前缀同样分块处理，不分配与总输出量同大的临时副本。匹配 `until` 使用未去除 ANSI 的解码文本，避免展示选项改变控制语义；窗口只含本调用起始 cursor 后仍保留的至多 buffer_bytes 字节，不受结果页 max_bytes 限制。Python `re` 不提供通用流式匹配状态，故采用每次输出/EOF revision 改变时对该有界窗口重新匹配，而不保存或扫描全部历史；没有输出变化时不反复扫描。复杂 regex 的 CPU 风险仍按既有风险声明处理。
 - **PTY 回显**：PTY 模式下终端会回显写入内容，因此 `terminal_write` 返回的输出包含输入本身；这是终端语义，需在 Tool 描述中说明。
 - **pipe 模式**：stdout、stderr 的每个块在到达时写进同一时间序缓冲并有 stream 标签；结果不合成为不可区分的 `output`，而返回 `stdout` 和 `stderr`。两个值之间的跨流显示先后以后台 reader 实际到达顺序为准，不伪造严格 OS 时间顺序。
 - **进程模型**：PTY 的 `pty.fork()` 令子进程成为新 session/进程组 leader 并拥有 controlling TTY，环境加 `TERM=xterm-256color`；pipe 的 `start_new_session=True` 令 leader PID=PGID。命令用 `/bin/sh -c`，默认 shell 用 `$SHELL -l`。fork 后的子进程只做 `TIOCSWINSZ`/`chdir`/`execvpe`，失败时 `os._exit(127)`，不执行其他 Python 逻辑（服务进程可能有 AnyIO 工作线程）。所有 PTY FD 设为 nonblocking，pipe 由独立 drain task 持续消费，避免高输出反压死锁。
-- **终止与 reap**：先向 `os.killpg(pgid, signal)` 发首信号，等待最多 `grace_ms`，存活则 `SIGKILL` 整组；等待 process handle 回收、关闭 FDs/取消 readers，因此不留下本服务创建的 zombie。父 shell 已退出而后台子进程还持有 PTY 时，仍按已保存 pgid 杀整组。
+- **终止与 reap**：先向 `os.killpg(pgid, signal)` 发首信号，等待最多 `grace_ms`，存活则 `SIGKILL` 整组；PTY 仅对自己创建的 leader 用 `waitpid(..., WNOHANG)`，pipe 由 asyncio child watcher 回收，读取 `returncode` 与 drain EOF 分离，避免后台持有流时 `Process.wait()` 阻塞退出报告。leader 退出后仍观察原组；自然消失立即关闭 I/O 并标记 group_cleaned，保留窗口内的幂等 kill/GC 不再次发信号。父 shell 已退出而后台子进程还持有 PTY 时，仍按已保存 pgid 杀整组。PTY job-control 的前台 PGID 若经 `getsid` 验证属于本会话，也纳入该次终止。macOS 退出窗口的 EPERM 只按“仍存在/尚未证明清理成功”处理，最终必须观察组消失，否则在 KILL 后 1 秒报告 INTERNAL_ERROR；不会把 EPERM 当作已杀灭。信号结果采用 `SIGTERM`/`SIGKILL` 等标准名称；显式 KILL 不计 escalated，宽限后升级才计 true。shutdown、kill 和 spawn 所有权任务屏蔽调用方取消，读/写响应等待取消不终止进程。
 - **会话状态**：`running`；`exited`（退出码）；`signaled`（信号）；`timed_out`（watchdog 引发）；`failed_to_start`（OS spawn 失败，伴随 `START_FAILED` 结构化错误）；`lost`（重启前遗留、不能接管）。`timeout_s` 满足后使用 TERM、配置的 1,000 ms 宽限、KILL；`terminal_kill` 的 `signal` 与 `grace_ms` 覆盖该次手动序列。
 - **连接结束**：stdio stdin EOF 或 server 的正常关闭导致 SDK lifespan `finally`；它首先停止接收新调用，再杀灭本实例所有进程组并 reap。没有 daemon，因此不会把会话移交给未来连接。
 - **注册表和重启 sweep**：状态目录 macOS 为 `~/Library/Application Support/terminal-mcp/`，Linux 为 `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`，可用 `--state-dir` 覆盖（测试必须用临时目录）。每个实例只写 `sessions/<owner_pid>-<启动时间戳>.json`，以临时文件 `fsync` 后 `os.replace` 原子更新；文件含 owner 的 PID 与 `lstart`，每条记录含 leader 的 PID、PGID 与 `ps -o lstart= -p <pid>` 去空白原文。新实例启动时扫描 `sessions/`：owner PID 仍存在且 `lstart` 匹配的文件属于活实例，跳过；其余文件先取 `fcntl.flock` 排他锁（取不到则跳过），对每条记录再执行 `ps -o pid=,pgid=,lstart= -p <pid>`，三值都匹配才对 PGID 发 HUP/TERM→KILL，否则绝不发信号。处理完的记录并入新实例内存中的 `lost` 列表（可 `terminal_list(include_exited=true)` 查询 600 秒后 GC），并删除原文件；新实例不恢复 I/O 或接管。实例正常退出时在杀完全部会话后删除自己的文件。
@@ -552,6 +552,7 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form；Claude Code 使用
 ## 实现记录（实际）
 
 - **FEAT-001-T01（实现完成，待主 Agent 验收）**：审阅并修正既有包/config/contracts/keys/policy 草稿，完成 `buffer.py`、`audit.py`、`registry.py`、`uv.lock` 和五个 `tests/unit/test_*.py`；五 Tool 联合 schema/稳定错误、默认路径/CLI/TOML、原始字节环/跨流 UTF-8/ANSI/CRLF、命名键、cwd/env/完整行策略、单次 O_APPEND JSONL 和按实例原子快照均有纯组件测试。保留 `terminal_kill` 对 `failed_to_start` 的幂等成功，相关契约已统一。历史首次 RED 为缺包 4 个收集错误（exit 2），随后依赖缓存不足导致受阻；主 Agent 补齐缓存和环境后，本次完全离线恢复，先运行 `uv run --offline pytest -q tests/unit` 再现缺 buffer/audit 的 3 个收集错误（exit 2），新增回归又分别证实 denylist 被替换/CRLF 重复提交（2 failed）、大 append 复制前缀/regex OverflowError（2 failed）和 TOML regex OverflowError（1 failed）。修复/重构后，设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1` 执行 `uv run --offline pytest -q tests/unit` 得 **117 passed**（exit 0）；`uv run --offline terminal-mcp --help` 和 `uv lock --locked --offline` 均 exit 0（37 packages）。中途 stdlib tracemalloc 尝试在仓库外生成 pyc 被策略拒绝，后续禁用 bytecode 写入，不申请额外权限。测试隔离 HOME/XDG/config/state，单测 15 秒上限；无实际进程信号、无网络、无新增依赖、未修改 lifecycle state。服务运行保留 T03 stub，异步会话/实际 sweep/README 分别留给 T02/T04/T05，当前证据不声称完成真实 MCP 或完整 US1–US8 验收。
+- **FEAT-001-T02（实现完成，待主 Agent 验收）**：新增 `src/terminal_mcp/session.py` 与 `tests/integration/test_session_core.py`、`test_lifecycle.py`，最小扩展 `buffer.py` 的 raw_text/revision；实现真实 PTY/pipe、新 session/进程组、尺寸/TERM、partial write/EAGAIN、写锁、五种等待原因、取消隔离、timeout/信号升级、leader reap 与流 EOF 分离、自然退出清理、600 秒保留/GC 和并行 shutdown_all。首次 RED：两测试模块因缺 session 模块而收集失败（exit 2）；补充 RED 分别锁定自然退出未完成清理（2 failed）、EOF 的 U+FFFD 未重匹配（2 failed）与 macOS 瞬时 EPERM 清理（1 failed + teardown error）。修复后设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp`，执行 `uv run --offline pytest -q tests/unit tests/integration/test_session_core.py tests/integration/test_lifecycle.py` 得 **159 passed**（7.95 s，exit 0），随后两个集成文件连续复跑两次均 **42 passed**（7.57/7.79 s）；`uv lock --locked --offline` 为 exit 0（37 packages），无新增依赖。测试只使用临时 config/state/cwd/HOME 和自己创建的 PID，断言 kill/shutdown 后 2 秒内 PID 消失；自然退出、父退出后后台持有 PTY/pipe、TERM 忽略、立即 kill、取消 read/write/kill wait、控制 TTY/C-c、REPL、上下文隔离/上限、GC、fork/exec 失败均覆盖。最初一次运行因 stdlib pyc 写到仓库外被拒，后续禁用 bytecode；本机自建 shell 可执行文件冷启动有延迟，登录参数测试使用有界 5 秒等待。仅交付内部会话核心，README 按原计划留给 T05，MCP/EOF 接线、restart/audit、Linux CI 与完整成功标准分别由 T03/T04/T05 后续验证；未修改或提交 state.json。
 
 ## 验证记录（实际）
 

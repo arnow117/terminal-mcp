@@ -94,6 +94,7 @@ class OutputBuffer:
         self.capacity_bytes = capacity_bytes
         self.mode = mode
         self.start_offset = self.end_offset = 0
+        self.revision = 0
         self._streams = ("pty",) if mode == "pty" else ("stdout", "stderr")
         self._chunks: deque[_Chunk] = deque()
         self._closed: set[str] = set()
@@ -144,11 +145,14 @@ class OutputBuffer:
             offset += count
         self.start_offset, self.end_offset = new_start, new_end
         self._stream_ends[stream] = new_end
+        self.revision += 1
 
     def close_stream(self, stream: str) -> None:
         """Mark EOF so a final incomplete sequence is emitted as U+FFFD."""
         self._check_stream(stream)
-        self._closed.add(stream)
+        if stream not in self._closed:
+            self._closed.add(stream)
+            self.revision += 1
 
     def _segments(self, start: int, end: int):
         for chunk in self._chunks:
@@ -181,6 +185,22 @@ class OutputBuffer:
             if strip_ansi and not final and stream in last and last[stream][1] == 13:
                 cutoff = min(cutoff, last[stream][0])
         return {stream: "".join(parts) for stream, parts in texts.items()}, cutoff
+
+    def raw_text(self, cursor: int) -> str:
+        """Decode the retained wait window in arrival order without stripping ANSI.
+
+        Stream decoders remain independent; a split code point appears when its
+        final bytes arrive. No text outside the bounded ring is retained.
+        """
+        if type(cursor) is not int or not 0 <= cursor <= self.end_offset:
+            raise ToolError("INVALID_ARGUMENT", "cursor must be an integer between zero and the current output end.")
+        decoders = {stream: codecs.getincrementaldecoder("utf-8")("replace") for stream in self._streams}
+        parts = []
+        for stream, _, data in self._segments(max(cursor, self.start_offset), self.end_offset):
+            parts.append(decoders[stream].decode(data))
+        for stream in self._closed:
+            parts.append(decoders[stream].decode(b"", final=True))
+        return "".join(parts)
 
     def read(self, cursor: int, max_bytes: int = 65536, strip_ansi: bool = True) -> OutputPage:
         if type(cursor) is not int or not 0 <= cursor <= self.end_offset:
