@@ -14,13 +14,15 @@ import termios
 import time
 from uuid import uuid4
 
+import anyio
+
 from .audit import Audit, current_call
 from .buffer import OutputBuffer
 from .config import Config
 from .contracts import ToolError, validate_arguments
 from .keys import encode_keys
 from .policy import CompleteLineTracker, Policy, PreparedStart
-from .procinfo import ProcessProbeError, process_identity
+from .procinfo import ProcessProbeError, process_identity, session_process_groups
 from .registry import Registry, RegistryRecord
 
 
@@ -204,10 +206,27 @@ class SessionManager:
             session.spawn_task = asyncio.create_task(self._spawn(session, prepared))
             # A cancelled start request does not abandon an in-flight spawn or its error.
             session.spawn_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
-        await asyncio.shield(session.spawn_task)
-        result = await self._read(session, 0, wait_ms=args["wait_ms"], until=args["until"], strip_ansi=args["strip_ansi"])
+        try:
+            await asyncio.shield(session.spawn_task)
+            result = await self._read(session, 0, wait_ms=args["wait_ms"], until=args["until"], strip_ansi=args["strip_ansi"])
+        except asyncio.CancelledError:
+            # Unlike a read cancellation, a cancelled start has not handed ownership
+            # to the client. Finish spawning, reap, then remove its private record.
+            cleanup = asyncio.create_task(self._cancel_start(session))
+            cleanup.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(cleanup)
+            raise
         result.pop("ended_at")
         return result | {"pid": session.pid, "pgid": session.pgid, "mode": session.mode, "started_at": session.started_at}
+
+    async def _cancel_start(self, session: Session) -> None:
+        await self._terminate(session, "KILL", 0, "shutdown")
+        if session.gc_task is not None:
+            session.gc_task.cancel()
+            await asyncio.gather(session.gc_task, return_exceptions=True)
+        self.sessions.pop(session.session_id, None)
+        self._persist(strict=False)
 
     async def _spawn(self, session: Session, prepared: PreparedStart) -> None:
         environment = dict(prepared.env)
@@ -245,7 +264,8 @@ class SessionManager:
             # A parent-side setup failure may occur after fork; never abandon that child.
             if session.pid is not None:
                 session.reaper_task = asyncio.create_task(self._reap(session))
-                await self._terminate(session, "KILL", 0, "shutdown")
+                # Do not await the spawn barrier from the spawn task itself.
+                await self._terminate_group(session, "KILL", 0, "shutdown")
             self._close_pty(session)
             session.status = "failed_to_start"
             session.ended_at = session.last_activity_at = _timestamp()
@@ -272,7 +292,7 @@ class SessionManager:
         except (OSError, ToolError) as exc:
             self._persistence_failed = True
             # A post-spawn persistence failure cannot leave an unregistered process.
-            await self._terminate(session, "KILL", 0, "shutdown")
+            await self._terminate_group(session, "KILL", 0, "shutdown")
             raise ToolError("INTERNAL_ERROR", "Cannot persist the new process identity.") from exc
 
     def _append(self, session: Session, stream: str, data: bytes) -> None:
@@ -348,10 +368,16 @@ class SessionManager:
         self._persist(strict=False)
         # Keep owning descendants after leader exit, but release dead groups promptly
         # so a retained result can never signal a PGID reused during its 600-second TTL.
-        while self._group_exists(session.pgid):
+        while not session.group_cleaned:
+            try:
+                if not session_process_groups(session.pid):
+                    session.group_cleaned = True
+                    break
+            except ProcessProbeError:
+                # Unknown is not gone; explicit termination has a bounded check.
+                pass
             await asyncio.sleep(_REPORT_INTERVAL)
         await self._close_streams(session)
-        session.group_cleaned = True
         if session.watchdog_task is not None:
             session.watchdog_task.cancel()
 
@@ -369,7 +395,7 @@ class SessionManager:
     async def _watchdog(self, session: Session) -> None:
         await asyncio.sleep(session.timeout_s)
         # Even a reaped leader may have left children holding the PTY or pipes.
-        if not session.group_cleaned and self._group_exists(session.pgid):
+        if not session.group_cleaned:
             await self._terminate(session, "TERM", self.config.kill_grace_ms, "timeout")
 
     async def read(self, session_id: str, cursor: int, **arguments) -> dict:
@@ -478,20 +504,10 @@ class SessionManager:
         validate_arguments("terminal_list", {"session_id": session_id, "include_exited": include_exited})
         sessions = ([self._get(session_id)] if session_id is not None else
                     [session for session in self.sessions.values() if include_exited or session.status == "running"])
+        sessions = [session for session in sessions if session.spawn_task is None or session.spawn_task.done()]
+        if session_id is not None and not sessions:
+            raise ToolError("SESSION_NOT_FOUND", "No completed session start has this ID.")
         return {"sessions": [session.summary() for session in sessions], "count": len(sessions)}
-
-    @staticmethod
-    def _group_exists(pgid: int | None) -> bool:
-        if pgid is None:
-            return False
-        try:
-            os.killpg(pgid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # macOS can report EPERM while an exiting group awaits reaping.
-            return True
 
     async def kill(self, session_id: str, **arguments) -> dict:
         args = validate_arguments("terminal_kill", {"session_id": session_id, **arguments})
@@ -509,24 +525,38 @@ class SessionManager:
                                    "escalated": session.escalated, "removed": args["remove"], "ended_at": session.ended_at}
 
     async def _terminate(self, session: Session, signal: str, grace_ms: int, reason: str) -> None:
+        if session.termination_task is not None and session.termination_task.done() and not session.group_cleaned:
+            session.termination_task = None
         if session.termination_task is None:
-            session.termination_task = asyncio.create_task(self._terminate_group(session, signal, grace_ms, reason))
+            session.termination_task = asyncio.create_task(self._terminate_after_spawn(session, signal, grace_ms, reason))
         # A cancelled handler must not cancel process ownership cleanup.
         await asyncio.shield(session.termination_task)
+
+    async def _terminate_after_spawn(self, session: Session, signal: str, grace_ms: int, reason: str) -> None:
+        # Never cache an empty cleanup while a process is still being created.
+        # Spawn's own failure path calls _terminate_group directly, avoiding a cycle.
+        if session.spawn_task is not None:
+            try:
+                await asyncio.shield(session.spawn_task)
+            except ToolError:
+                pass  # Failed spawn still needs final ownership cleanup.
+        await self._terminate_group(session, signal, grace_ms, reason)
 
     async def _terminate_group(self, session: Session, signal: str, grace_ms: int, reason: str) -> None:
         session.writes_closed = True
         session.termination_reason = session.termination_reason or reason
-        groups = {session.pgid} if session.pgid is not None and not session.group_cleaned else set()
-        if session.master_fd is not None:
-            try:
-                foreground = os.tcgetpgrp(session.master_fd)
-                if foreground > 0 and os.getsid(foreground) == session.pid:
-                    groups.add(foreground)
-            except (ProcessLookupError, OSError):
-                pass
 
-        def send(name):
+        def members():
+            if session.group_cleaned or session.pid is None:
+                return set()
+            # setsid makes SID == our child PID. While members remain the SID
+            # cannot be reused; latch the first empty scan before any further await.
+            groups = session_process_groups(session.pid)
+            if not groups and session.exited.is_set():
+                session.group_cleaned = True
+            return groups
+
+        def send(groups, name):
             for pgid in groups:
                 try:
                     os.killpg(pgid, getattr(signals, f"SIG{name}"))
@@ -537,25 +567,35 @@ class SessionManager:
                     # not success: the bounded group-disappearance check still applies.
                     pass
 
-        send(signal)
+        # Parent-side PTY setup may fail before the forked child completes setsid.
+        deadline = asyncio.get_running_loop().time() + 1
+        while not (groups := members()) and session.pid is not None and not session.exited.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ToolError("INTERNAL_ERROR", "Cannot confirm the new session before cleanup.")
+            await asyncio.sleep(_REPORT_INTERVAL)
+        send(groups, signal)
         deadline = asyncio.get_running_loop().time() + (0 if signal == "KILL" else grace_ms / 1000)
-        while any(self._group_exists(pgid) for pgid in groups):
+        signaled = set(groups)
+        while groups := members():
             if asyncio.get_running_loop().time() >= deadline:
                 if signal != "KILL":
                     session.escalated = True
-                    send("KILL")
                 break
+            # Include jobs created during the grace interval, not just its snapshot.
+            send(groups - signaled, signal)
+            signaled.update(groups)
             await asyncio.sleep(_REPORT_INTERVAL)
         # Allow the OS to reap orphan descendants; never waitpid unrelated children.
         deadline = asyncio.get_running_loop().time() + 1
-        while any(self._group_exists(pgid) for pgid in groups):
+        while groups := members():
             if asyncio.get_running_loop().time() >= deadline:
-                raise ToolError("INTERNAL_ERROR", "The owned process group has not disappeared after SIGKILL.")
+                raise ToolError("INTERNAL_ERROR", "The owned session has not disappeared after SIGKILL.")
+            send(groups, "KILL")
             await asyncio.sleep(_REPORT_INTERVAL)
+        session.group_cleaned = True
         if session.reaper_task is not None:
             await session.reaper_task
         await self._close_streams(session)
-        session.group_cleaned = True
         if session.watchdog_task is not None and not session.watchdog_task.done():
             session.watchdog_task.cancel()
         session.notify()

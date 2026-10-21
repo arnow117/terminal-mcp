@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import stat
 import time
 from typing import Any, Mapping
 
@@ -45,8 +46,15 @@ class Audit:
         record["result"] = _select(event.get("result"), {"status", "exit_code", "signal", "error_code"})
         line = (json.dumps(record, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        # NOFOLLOW rejects symlinks atomically; NONBLOCK prevents a FIFO from
+        # hanging the fail-closed check before fstat can reject its descriptor.
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise OSError(errno.EPERM, "Audit storage must be a regular file owned by the current user")
+            if stat.S_IMODE(info.st_mode) & ~0o600:
+                os.fchmod(fd, 0o600)
             if os.write(fd, line) != len(line):
                 # Retrying would let another instance split this JSONL record.
                 raise OSError(errno.EIO, "Incomplete audit write")

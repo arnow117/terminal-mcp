@@ -1,5 +1,6 @@
 """Bounded-output performance checks use actual server RSS, not Python allocations."""
 
+import asyncio
 import time
 
 import anyio
@@ -14,10 +15,25 @@ pytestmark = pytest.mark.anyio
 
 async def test_wait_latency_under_200ms(tmp_path):
     async with connection(tmp_path) as server:
+        release = tmp_path / "produce-output"
+        code = (f"import time; from pathlib import Path; gate=Path({str(release)!r})\n"
+                "while not gate.exists(): time.sleep(.001)\n"
+                "print(time.monotonic_ns(),flush=True); time.sleep(60)")
         result = await server.call("terminal_start", {
-            "command": python_command("import time; time.sleep(.3); print(time.monotonic_ns(),flush=True); time.sleep(60)"), "mode": "pipe",
+            "command": python_command(code), "mode": "pipe",
         })
-        page = await server.call("terminal_read", {"session_id": result["session_id"], "cursor": 0, "wait_ms": 3000})
+        waiter = asyncio.create_task(server.call("terminal_read", {"session_id": result["session_id"], "cursor": 0, "wait_ms": 3000}))
+        try:
+            await anyio.sleep(.05)
+            # A later request completes while the earlier read is still pending.
+            summary = await server.call("terminal_list", {"session_id": result["session_id"]})
+            assert summary["sessions"][0]["output_total_bytes"] == 0
+            assert not waiter.done() and not release.exists()
+            release.touch()
+            page = await waiter
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
         latency_ms = (time.monotonic_ns() - int(page["stdout"].strip())) / 1_000_000
         assert latency_ms < 200, f"Observed output-to-client latency: {latency_ms:.3f} ms"
         print(f"wait_latency_ms={latency_ms:.3f}")

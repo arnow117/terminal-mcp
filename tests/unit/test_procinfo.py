@@ -114,3 +114,55 @@ def test_darwin_layout_and_wrong_pid_are_rejected(monkeypatch):
     monkeypatch.setattr(module, "_pidinfo", wrong_pid)
     with pytest.raises(ProcessProbeError):
         process_identity(42)
+
+
+def test_session_groups_self_child_and_exited():
+    from terminal_mcp.procinfo import session_process_groups
+
+    assert os.getpgrp() in session_process_groups(os.getsid(0))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        assert session_process_groups(child.pid) == {child.pid}
+    finally:
+        child.kill()
+        child.wait(timeout=2)
+    assert session_process_groups(child.pid) == set()
+
+
+def test_session_groups_linux_stat_and_disappearance(tmp_path, monkeypatch):
+    import terminal_mcp.procinfo as module
+
+    (tmp_path / "42").mkdir()
+    (tmp_path / "43").mkdir()  # Disappeared between directory enumeration and stat.
+    (tmp_path / "42/stat").write_text("42 (name (with ) spaces) S 1 41 40 " + "0 " * 20)
+    monkeypatch.setattr(module, "_PROC", tmp_path)
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    assert module.session_process_groups(40) == {41}
+    assert module.session_process_groups(42) == set()
+    (tmp_path / "42/stat").write_text("malformed")
+    with pytest.raises(ProcessProbeError):
+        module.session_process_groups(40)
+
+
+def test_session_groups_darwin_esrch_and_permission(monkeypatch):
+    import terminal_mcp.procinfo as module
+
+    def listpids(buffer, size):
+        if buffer is None:
+            return 2
+        buffer[0], buffer[1] = 42, 43
+        return 2
+
+    def getsid(pid):
+        if pid == 43:
+            raise ProcessLookupError(errno.ESRCH, "Synthetic exit race")
+        return 40
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_listallpids", listpids, raising=False)
+    monkeypatch.setattr(module.os, "getsid", getsid)
+    monkeypatch.setattr(module.os, "getpgid", lambda pid: 41)
+    assert module.session_process_groups(40) == {41}
+    monkeypatch.setattr(module.os, "getsid", lambda pid: (_ for _ in ()).throw(PermissionError(errno.EPERM, "Synthetic denial")))
+    with pytest.raises(ProcessProbeError):
+        module.session_process_groups(40)

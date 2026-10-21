@@ -94,7 +94,7 @@ Returns `count` and `sessions`. Each session summary contains `session_id`, `nam
 
 ### `terminal_kill`
 
-Terminate the entire Unix process group, not only its parent process.
+Terminate every process group in the owned Unix session, including foreground and background shell jobs, not only its parent process.
 
 | Key parameters | Defaults / limits |
 |---|---|
@@ -205,6 +205,8 @@ Default filesystem locations:
 
 The state directory contains `audit.jsonl` (append-only metadata-only audit records) and per-instance registry snapshots at `sessions/<owner-pid>-<instance-id>.json`. Audit records omit output bodies and store tool/session metadata, parameter summaries, policy decisions, and result fields. State/config directories are created only when the server needs to persist a registry or audit event.
 
+The audit `command` field contains the **full start command and submitted input lines**, including policy-denied lines. Do not type secrets into sessions or embed them in commands, and do not publish audit files. Each audit append requires a regular file owned by the current user; symlinks are rejected and permissions wider than `0600` are tightened to `0600`. An audit failure refuses new starts until the storage is repaired and the server restarted.
+
 ### Security boundary
 
 `terminal-mcp` provides **best-effort guardrails, not a security sandbox**. It runs commands as the current user. Allowed-root checks, sensitive-environment filtering, dangerous-command rules, resource limits, and audit records help prevent accidental agent misuse and data leakage, but they do not confine a malicious command or fully inspect arbitrary interactive input. Do not expose it to untrusted agents, and use OS/container isolation when a stronger boundary is required.
@@ -213,9 +215,14 @@ The state directory contains `audit.jsonl` (append-only metadata-only audit reco
 
 - Sessions belong to **one server process and its stdio connection**. They are not a daemon and cannot be reattached after client disconnect.
 - Stdio EOF, normal shutdown, handler failure, or cancellation triggers cleanup of all sessions owned by that server process.
-- Each session has an independent Unix process group. Cleanup targets the group, including children.
-- On a later server start, per-instance registry data is checked conservatively. Confirmed leftover process groups are cleaned and old records become `lost`; they are never adopted by the new server.
+- Each session has an independent Unix SID equal to its leader PID. Cleanup enumerates all member process groups, including interactive background jobs, then waits for disappearance after the requested signal and escalation to `KILL` if necessary.
+- Pending starts are not listed until spawning completes. Cancelling `terminal_start` kills and reaps any process it created and removes its record; cancelling an ordinary read only stops that read.
+- On a later server start, per-instance registry data is checked conservatively. Only when the recorded leader's PID, PGID, and start time still match can all groups of its SID be cleaned. If the leader is already gone, the server does not signal by SID alone because its generation cannot be confirmed. Old records become `lost`; they are never adopted by the new server.
 - Exited and lost sessions normally remain queryable/readable for 600 seconds. `remove: true` or retention expiry removes them.
+
+### Known limitations
+
+Pipe mode with very frequent interleaved small stdout/stderr writes has higher per-chunk memory overhead than the 1 MiB raw-output limit suggests. A more compact buffer representation is planned for the next iteration. Processes that deliberately detach into another Unix session are outside this session-based cleanup boundary.
 
 ## MCP client registration
 

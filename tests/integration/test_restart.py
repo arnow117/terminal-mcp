@@ -347,7 +347,7 @@ async def test_sweep_waits_through_transient_group_eperm(config, monkeypatch):
 
         def transient_group(pgid, sig):
             nonlocal denied
-            if pgid == child.pid and sig == 0 and not denied:
+            if pgid == child.pid and sig == signal.SIGTERM and not denied:
                 denied = True
                 raise PermissionError("Synthetic exiting group permission race")
             return actual_killpg(pgid, sig)
@@ -364,3 +364,37 @@ async def test_sweep_waits_through_transient_group_eperm(config, monkeypatch):
         if child.returncode is None:
             child.kill()
         await child.wait()
+
+
+async def test_restart_sweeps_all_sid_groups_after_leader_exits_on_term(config):
+    # The child ignores TERM and moves to its own PGID, but keeps the parent's SID.
+    code = ("import os,signal,subprocess,sys,time\n"
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "\"import os,signal,time; os.setpgid(0,0); signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)\"])\n"
+            "time.sleep(60)")
+    child = await asyncio.create_subprocess_exec(sys.executable, "-c", code, start_new_session=True, stdout=asyncio.subprocess.PIPE)
+    background = None
+    manager = SessionManager(replace(config, kill_grace_ms=100))
+    try:
+        with anyio.fail_after(2):
+            background = int(await child.stdout.readline())
+        assert os.getsid(background) == child.pid and os.getpgid(background) == background
+        observed = process_identity(child.pid)
+        stale = Registry(config.state_dir, owner_pid=os.getpid(), owner_start_time="reused", instance_id="sid")
+        sid = str(uuid4())
+        stale.write([RegistryRecord(sid, child.pid, child.pid, observed.start_time, "2026-10-21T00:00:00Z", "running")])
+        before = time.monotonic()
+        await manager.initialize()
+        await gone([child.pid, background], before + 2)
+        assert not stale.path.exists()
+        assert (await manager.list(sid))["sessions"][0]["status"] == "lost"
+    finally:
+        for pid in (child.pid, background):
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        await child.wait()
+        await manager.shutdown_all()
+        await gone([pid for pid in (child.pid, background) if pid is not None], time.monotonic() + 2)

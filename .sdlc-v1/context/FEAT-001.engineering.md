@@ -60,6 +60,7 @@ session.py: SessionManager ─── registry.py ─── procinfo.py
 - **职责**：拥有进程句柄/PTY FD、PID/PGID、状态、并发写锁、timeout task、退出信息和输出通知；创建两个后端，串行化同一会话写入，维护 16 会话限制，负责整组信号、reap、保留和 GC。
 - **接口**：`SessionManager(config)`，六个入口均为 async：`start(**tool_arguments)`、`read(session_id, cursor, **options)`、`write(session_id, **options)`、`list(session_id=None, include_exited=True)`、`kill(session_id, **options)`、`shutdown_all()`；成功返回与 `contracts.py` 对应的普通 dict，业务错误抛 `ToolError`。Manager 复用参数校验和 `Policy`，完整行 tracker 与实际 write 共用写锁；取消/失败的部分写入后禁用该会话后续写入，避免 tracker 与已发送内容失配。调用者绝不直接操作 `Popen`/FD；T03 负责 MCP 分派；T04 已接通 `initialize()`、每次状态变化的 `_persist()`、`_accept_lost()`、故障锁存与策略审计回调。内部直接调用 start 时也会幂等初始化。
 - **覆盖**：`REQ-F01` 至 `REQ-F05`。
+- **启动所有权屏障**：spawn 未完成的记录占用容量但不出现在 list（含指定 ID 查询）；kill、watchdog 与 shutdown 的清理任务等待被 shield 的 spawn 成功/失败后才收尾，不缓存空清理。取消 start 时完成在途 spawn、KILL/reap 并移除记录；spawn 自身错误路径直接进入清理核心，避免等待自己的 task。取消普通 read/write 响应等待不杀进程。
 
 ##### `buffer.py`：有界原始字节输出缓冲
 
@@ -132,6 +133,7 @@ src/terminal_mcp/
 - **背景**：stdio 没有断线重连；DEC-006 要求 EOF/正常关闭清掉全部进程，同时强杀后能安全处置遗留进程。
 - **决定**：SDK lifespan 每个 server 运行实例一次；其 `finally` 无条件按进程组终止和 reap 所有本实例会话。注册表仅用于下一实例启动时清扫；不承诺恢复或接管旧会话，旧记录一律变 `lost`。
 - **替代项**：让 session 脱离 stdio 客户端长期存活，或由新连接接管。
+- **清理边界**：两个后端都以 setsid 建立 SID=leader PID；枚举并核验该 SID 的全部成员 PGID，含交互 shell 的前台和后台 job。首信号→宽限→KILL 后必须确认整个 SID 无成员才释放所有权。重启时须先匹配记录的 leader 三元身份；匹配后的连续非空 SID 可在 leader 被 TERM 杀掉后继续清理；启动时 leader 已不存在则仍不按 SID 单独发信号，防止无法辨别的 PID/SID 复用。
 - **取舍**：客户端 EOF 会结束任务；这是 DEC-006 所有权边界，也是没有 daemon 时最安全和最简单的行为。
 - **覆盖**：`REQ-F04`、`REQ-F05`、`REQ-F07`。
 
@@ -157,6 +159,7 @@ src/terminal_mcp/
 - **字段命名**：注册表与代码中原 `owner_lstart`/`leader_lstart` 统一改名为 `owner_start_time`/`leader_start_time`，语义为上述令牌；文中其余提到 `lstart` 处均按此理解。
 - **替代项**：继续调用 `ps`（在受限环境不可用）；引入 `psutil`（含原生编译扩展，违背 DEC-001）。
 - **取舍**：维护一小段 `ctypes` 结构体定义（`proc_bsdinfo` 136 字节，主 Agent 已在本机验证读出 PID/PGID/微秒级启动时间与 RSS，对非本用户进程返回 `EPERM`、对已退出进程返回 `ESRCH`）；换来无外部命令、无本地化解析、精度更高的身份校验。
+- **会话成员 API**：`session_process_groups(sid) -> set[int]` 返回已核验成员的全部 PGID，空集才代表不存在。macOS 用 `proc_listallpids`（`[c_void_p,c_int] -> c_int`）两次调用、按 count+64 分配，列表满时有界重试，再对 PID 调 `getsid/getpgid` 并复核 SID；Linux 遍历数字 `/proc/<pid>`，从 stat 最后一个 `)` 后读取 state/ppid/pgrp/session。ESRCH/已删除 stat 竞态忽略，其余错误抛 `ProcessProbeError`，绝不以不完整扫描宣告清理成功。SID 连续有成员期间不可复用，首次确认空集即停止使用它发信号。
 - **覆盖**：`REQ-F05`、US7、SC-005。
 
 #### 数据模型 / 关键实体
@@ -286,7 +289,7 @@ src/terminal_mcp/
 1. client 先以 `terminal_start` 创建会话，保存 `session_id` 与 `next_cursor`。PTY 创建子 session/控制终端，pipe 建立三条 pipe；两个后端都为该会话建立新进程组。
 2. 后台 FD reader/drainer 仅追加带来源标签的原始 bytes 到 `OutputBuffer`，更新绝对 `end_offset`，并唤醒该会话的等待条件；不会在 Tool handler 内等待进程输出。
 3. `terminal_read`/`terminal_write` 先取快照。无 `until` 时，有可读新输出即返回；有 `until` 时，每次追加都在从本调用起始 cursor 到当前末尾的未剥离 UTF-8 文本上做 `re.search`，仅在命中、进程退出或 deadline 才返回。故 `Password:`、`>>> ` 等无换行部分字符串可匹配。`wait_ms=0` 永不等待。
-4. MCP 客户端取消某个等待请求时，SDK v2 递送取消并取消此 handler 的 await；handler 只释放其 waiter，不调用 `kill`、不清空 buffer，后台进程和其他 Tool 继续工作。
+4. MCP 客户端取消普通 read/write 等待时，SDK v2 递送取消并取消此 handler 的 await；handler 只释放其 waiter，不调用 `kill`、不清空 buffer，后台进程和其他 Tool 继续工作。start 尚未完成交付时取消则走独立 shield 清理，等待 spawn 后杀灭/reap 并移除该记录；kill 取消只取消调用者等待，已启动的所有权清理继续。
 5. `terminal_kill`、timeout、stdio EOF 或 lifespan 退出都走同一整组杀灭/等待/reap 路径。进程退出后仍保留环形输出 600 秒；GC 后只能得到 `SESSION_NOT_FOUND`。
 
 #### 输出游标、等待与进程语义
@@ -298,10 +301,10 @@ src/terminal_mcp/
 - **PTY 回显**：PTY 模式下终端会回显写入内容，因此 `terminal_write` 返回的输出包含输入本身；这是终端语义，需在 Tool 描述中说明。
 - **pipe 模式**：stdout、stderr 的每个块在到达时写进同一时间序缓冲并有 stream 标签；结果不合成为不可区分的 `output`，而返回 `stdout` 和 `stderr`。两个值之间的跨流显示先后以后台 reader 实际到达顺序为准，不伪造严格 OS 时间顺序。
 - **进程模型**：PTY 的 `pty.fork()` 令子进程成为新 session/进程组 leader 并拥有 controlling TTY，环境加 `TERM=xterm-256color`；pipe 的 `start_new_session=True` 令 leader PID=PGID。命令用 `/bin/sh -c`，默认 shell 用 `$SHELL -l`。fork 后的子进程只做 `TIOCSWINSZ`/`chdir`/`execvpe`，失败时 `os._exit(127)`，不执行其他 Python 逻辑（服务进程可能有 AnyIO 工作线程）。所有 PTY FD 设为 nonblocking，pipe 由独立 drain task 持续消费，避免高输出反压死锁。
-- **终止与 reap**：先向 `os.killpg(pgid, signal)` 发首信号，等待最多 `grace_ms`，存活则 `SIGKILL` 整组；PTY 仅对自己创建的 leader 用 `waitpid(..., WNOHANG)`，pipe 由 asyncio child watcher 回收，读取 `returncode` 与 drain EOF 分离，避免后台持有流时 `Process.wait()` 阻塞退出报告。leader 退出后仍观察原组；自然消失立即关闭 I/O 并标记 group_cleaned，保留窗口内的幂等 kill/GC 不再次发信号。父 shell 已退出而后台子进程还持有 PTY 时，仍按已保存 pgid 杀整组。PTY job-control 的前台 PGID 若经 `getsid` 验证属于本会话，也纳入该次终止。macOS 退出窗口的 EPERM 只按“仍存在/尚未证明清理成功”处理，最终必须观察组消失，否则在 KILL 后 1 秒报告 INTERNAL_ERROR；不会把 EPERM 当作已杀灭。信号结果采用 `SIGTERM`/`SIGKILL` 等标准名称；显式 KILL 不计 escalated，宽限后升级才计 true。shutdown、kill 和 spawn 所有权任务屏蔽调用方取消，读/写响应等待取消不终止进程。
+- **终止与 reap**：spawn 屏障之后通过 `session_process_groups(leader_pid)` 确认全部成员 PGID，再逐组 `os.killpg(pgid, signal)`；宽限期重新枚举并纳入新 job，存活成员升级 `SIGKILL`，KILL 后最多再等 1 秒。只对当次已确认属于本 SID 的组发信号，不沿用失效 PGID 快照。PTY 仅对自建 leader 用 `waitpid(..., WNOHANG)`，pipe 用 asyncio child watcher；`returncode` 与 drain EOF 分离。leader 退出后仍观察整个 SID，包含独立后台 PGID；首次确认无成员即标记 group_cleaned 并停止后续信号，再关闭 I/O，防保留期 PID/SID 复用。EPERM 不等于成功，成员未消失或枚举不完整均不能标记已清理；失败返回 INTERNAL_ERROR 并保留所有权记录供重试。显式 KILL 不计 escalated，宽限后升级才计 true。spawn 自身出错直接进入清理核心，不 await 自己的 task。
 - **会话状态**：`running`；`exited`（退出码）；`signaled`（信号）；`timed_out`（watchdog 引发）；`failed_to_start`（OS spawn 失败，伴随 `START_FAILED` 结构化错误）；`lost`（重启前遗留、不能接管）。`timeout_s` 满足后使用 TERM、配置的 1,000 ms 宽限、KILL；`terminal_kill` 的 `signal` 与 `grace_ms` 覆盖该次手动序列。
 - **连接结束**：stdio stdin EOF 或 server 的正常关闭导致 SDK lifespan `finally`；它首先停止接收新调用，再杀灭本实例所有进程组并 reap。没有 daemon，因此不会把会话移交给未来连接。
-- **注册表和重启 sweep**：状态目录 macOS 为 `~/Library/Application Support/terminal-mcp/`，Linux 为 `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`，可用 `--state-dir` 覆盖（测试必须用临时目录）。每个实例只写 `sessions/<owner_pid>-<instance_id>.json`，以临时文件 `fsync` 后 `os.replace` 原子更新；文件含 owner 的 PID 与启动时间令牌，每条记录含 leader 的 PID、PGID 与启动时间令牌（均由 `procinfo.process_identity()` 获取，决定 6）。新实例启动时扫描 `sessions/`：owner 身份仍匹配或无法确认的文件跳过；确定 owner 已不存在的文件先取 `fcntl.flock` 排他锁（取不到则跳过），对每条记录再取 `process_identity(leader_pid)`，PID、PGID、启动时间令牌三者都匹配才对 PGID 发 HUP/TERM→KILL；确定不存在则不发信号；无法确认则不发信号并保留该文件留待下次。已处理的记录并入新实例内存中的 `lost` 列表（可 `terminal_list(include_exited=true)` 查询 600 秒后 GC），并删除原文件；新实例不恢复 I/O 或接管。实例正常退出时在杀完全部会话后删除自己的文件。清扫在持锁后校验 inode 防止双实例读取已被另一清扫者删除的旧文件；先预检同一文件全部 leader，任何无法确认均保留整文件，不部分导入。每次非零信号（含升级 KILL）前重新核对完整身份；组存在性探测出现短暂 EPERM 时按仍未证实消失进行有界等待，仍无法确认则保留文件。lost 记录先写入新实例快照，成功后才删除源文件；lost 的 GC/shutdown 不发信号。
+- **注册表和重启 sweep**：状态目录 macOS 为 `~/Library/Application Support/terminal-mcp/`，Linux 为 `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`，可用 `--state-dir` 覆盖（测试用临时目录）。每实例只写 `sessions/<owner_pid>-<instance_id>.json`，以临时文件 fsync+replace 原子更新。扫描旧文件时先锁文件并校验 inode、owner；owner 仍活或未知则跳过。预检全部 leader 的 PID、PGID、启动时间令牌；匹配且 PID=PGID 时才取得 SID 所有权并清理全部成员组。leader 在首信号后退出不阻断持续非空 SID 的后续 KILL，但每轮仍复核存活 leader 身份；首次空集即停止扫描/发信号。启动时 leader 已不存在或不匹配则绝不按 SID 单独清扫，只转为 lost；身份/成员无法确认或清理失败保留源文件。EPERM 不当作消失；KILL 后 1 秒仍有成员则保留文件。lost 先持久化到新实例后才删源文件，可查询 600 秒，GC/shutdown 不发信号；正常关闭在所有本实例会话清理完毕后删自身注册表。
 
 #### 横切质量设计
 
@@ -332,9 +335,13 @@ pattern = "rm\\s+[^\\n]*-rf[^\\n]*\\s/(?:\\s|$)"
 - **审计**：审计文件为 state 目录下 `audit.jsonl`，每次 Tool 调用和策略判定追加一行，字段为 `timestamp`、`tool`、`session_id`、`command`（start 命令或被检查的完整 write 行；其他 Tool 为 `null`）、`cwd`、`mode`、`parameter_summary`、`policy:{decision,rule_id}`、`result:{status,exit_code,signal,error_code}`、`duration_ms`。不写 `output`、`stdout`、`stderr` 或环境变量值。审计文件本身可能包含命令文本，必须按本机敏感日志保护，不能提交到 Git。T04 使用调用前 pending 行、每次规则 allow/deny/filter 行及调用完成行；取消等待记录 `CANCELLED` 后继续向 SDK 传播取消，完整 write 行之外不记录输入正文。所有事件按当前请求 ContextVar 关联，避免并发串话；状态结果行保留退出码/信号/稳定错误码。
 - **诚实限制**：这是防 Agent 误操作和意外泄密的 best-effort guardrail，不是 OS sandbox，也不能防止当前用户、shell 转义/编码、已允许程序的二次下载、交互式编辑器动作或故意规避规则。服务以当前用户权限执行；MVP 不实施 elicitation 审批，命中规则一律拒绝。
 
+审计以 `O_APPEND|O_NOFOLLOW|O_NONBLOCK` 打开，避免跟随符号链接或阻塞在 FIFO；每次追加前 fstat 要求当前 uid 所有的普通文件，权限宽于 0600 时 fchmod 收紧。任一步骤失败走现有 INTERNAL_ERROR/故障锁存，拒绝新 start。README 明确完整命令/已提交输入行可能含敏感信息，不应输入秘密或发布 audit 文件；同时公开 R3 高频交错小块 pipe 输出的片段元数据开销，缓冲重写留待下一迭代。
+
 ##### 可靠性、性能与观测
 
 每会话分别使用写锁与输出条件，故并发读取不互相推进 cursor，写入按进入 manager 的顺序串行；等待中的会话不持有全局锁。环形缓冲、每次读取 1 MiB 上限、读端 drain 和 16 会话上限形成容量边界。audit 写失败或 registry 写失败是 `INTERNAL_ERROR` 且锁存故障，直到用户修复 state 目录并重启前都拒绝新启动，不静默降级。start 在 spawn 前验证注册表可写，spawn 后采集并保存原生身份；后置写入/身份探测失败则立即 KILL 并 reap 该新进程后报错。后台退出/GC 写失败同样锁存，在后续 Tool 边界报告 INTERNAL_ERROR。持久化故障不阻断已有会话的显式 kill 与 EOF/shutdown 回收；kill 仍清理进程，但因审计/持久化未成功而返回 INTERNAL_ERROR。运行时日志仅记录错误码/ID；发布前检查 `.gitignore` 和 `git status`，确保审计、state、config 本机路径和任何密钥不进入公开仓库。
+
+CI 在 ubuntu-latest/macOS 运行锁定环境的全套测试，顶层 `permissions: contents: read`；checkout 固定 `11d5960a326750d5838078e36cf38b85af677262`（v4.4.0），setup-uv 固定 `d0cc045d04ccac9d8b7881df0226f9e82c39688e`（v6.8.0），不使用可移动 action 标签。SC-003 以 pending read 与后续 list 往返确认尚无输出，再创建子进程等待的 gate 文件；仍严格断言实际输出时间到客户端返回小于 200 ms。
 
 #### 风险与取舍
 
@@ -577,6 +584,8 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form（command 为 `uv`�
 - **FEAT-001-T04（实现完成，待主 Agent 验收）**：按决定 6 新增标准库原生 `procinfo.py`（macOS libproc / Linux procfs），统一 `owner_start_time`/`leader_start_time`；完成按实例注册表、状态变更原子持久化、flock/inode/owner/leader 三元身份保守清扫、SIGKILL 重启遗留组回收、600 秒 lost/SESSION_LOST、审计与策略回调、故障锁存和 EOF 删除实例文件。复审并更新前次测试草稿；本次原生模块 RED 为 **4 个收集错误**（exit 2），接线 RED 为 **2 failed**；原生单测先行 **8 passed**，首轮专项 **34 passed**。首次全量 **6 failed, 226 passed**（旧注册表参数和 T03 mock 接口未更新），以最小改动调整 `tests/unit/test_policy.py`、`test_audit_registry.py`、`tests/integration/test_mcp_stdio.py`；加强多进程重启测试后发现 macOS 短暂组探测 EPERM（**1 failed, 237 passed**），新增确定性 RED 后修复为有界等待；另新增审计失败不应阻止显式 kill 的 RED 后修复。所有运行设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 且使用 `uv run --offline`。最终未再改代码的两次完整 `pytest -q` 均 **240 passed**（46.72 s / 34.92 s，exit 0）；日志为 `.work/t04-full-green-1.log`、`.work/t04-full-green-2.log`，此前 RED 与专项日志同在忽略目录 `.work/`。专项测得 wait 延迟 **19.291 ms**、50 MB 输出 RSS 增长 **1,654,784 bytes**（小于 3 MiB）、突发期间最大 list 延迟 **2.213 ms**，retained bytes 始终不超过 1 MiB；两次最终全量也执行相同严格性能断言。US4-3、US6-1~4、US7-1、US2-4、边界 1/2/4/8 与 SC-003/004/005 均覆盖；原生身份测试含 self、child、exited child、pid 1、ABI/错误返回和 Linux stat 尾括号解析。未调用受禁进程命令、未联网、未添加依赖、未写真实用户 state/config/HOME、未修改或提交 state.json；README/CI 仍按计划留给 T05，Linux 真机与 Manus US8 验证仍由后续阶段完成。
 
 - **FEAT-001-T05（实现完成，待主 Agent 验收）**：新增唯一全局 usage 入口 `README.md`、MIT `LICENSE`、双平台 GitHub Actions `.github/workflows/ci.yml`，并在 `pyproject.toml` 补充 README/MIT 元数据；README 按实际 `tools/list` 契约记录五 Tool、游标/REPL/kill 流程、状态/错误恢复、TOML/路径/审计注册表、安全及生命周期边界，以及 Manus/Claude Code/Codex/JSON 的本地 `uv` 和公开 `uvx` 注册命令与 US1–US8（含 Manus 手工 E2E）映射。`uv.lock` 经检查无须变更。使用 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp` 验证 `uv lock --locked --offline`、`uv run --offline terminal-mcp --help`、`grep -n "/Users/" README.md`（无匹配）、Ruby YAML 结构检查和 `git diff --check` 均 exit 0；`uv run --offline pytest -q` 得 **240 passed**（38.32 s，exit 0）。未改运行时代码、测试或 `.sdlc-v1/state.json`，未联网、未新增依赖；Linux CI 运行与 Manus US8 仍留主 Agent validate。
+
+- **FEAT-001-T06（第 1 轮评审返修）**：R1：`procinfo.session_process_groups()`（macOS libproc `proc_listallpids` + `getsid`/`getpgid` 复核；Linux `/proc/<pid>/stat`），kill、timeout、stdio EOF/shutdown 与自然退出均清理 SID 等于 leader PID 的全部成员 PGID，确认无成员才标记 `group_cleaned`；重启清扫在 leader 身份匹配时同样覆盖全部 SID 成员，leader 已消失时仍不按 SID 发信号。R2：spawn 未完成的会话不出现在 `terminal_list`；kill/shutdown/watchdog 通过 shield 的 termination task 等待 spawn 成功或失败后再清理，不缓存空清理；被取消的 start 在 spawn 前后与初始等待中均清理进程并删除记录。R4：`audit.py` 以 `O_NOFOLLOW|O_NONBLOCK` 打开并 `fstat` 校验普通文件与当前 uid，宽于 0600 时 `fchmod`，symlink/FIFO/非本人文件走 fail-closed；README 说明审计 `command` 含完整命令与提交的输入行。R5：CI 固定 `actions/checkout@11d5960…`（v4.4.0）、`astral-sh/setup-uv@d0cc045…`（v6.8.0），顶层 `permissions: contents: read`。覆盖缺口：新增真实 stdio 的交互 bash 单个/三个后台 job + 前台 job 在 kill/EOF/timeout 后 2 秒内全部消失、PTY/pipe 忽略 TERM 后升级 KILL、SC-003 以 gate 文件确保 read 已在等待；R3 未改 `buffer.py`，README Known limitations 已披露。RED：首次 19 failed（含 6 项 bash 历史展开导致的 setup 问题，修正后真实 R1 RED 6 failed）、重启专项 1 failed；GREEN：全量 `uv run --offline pytest -q` 连续两次 **267 passed**（108.56 s、100.59 s）；`uv lock --locked --offline`、`--help`、CI YAML 结构检查通过。子 Agent 在提交前耗尽预算，由主 Agent 核对改动范围后补写本条记录并提交。
 
 ## 验证记录（实际）
 

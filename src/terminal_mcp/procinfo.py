@@ -42,11 +42,15 @@ class _TaskInfo(ctypes.Structure):
 
 _PROC = Path("/proc")
 _pidinfo = None
+_listallpids = None
 if sys.platform == "darwin":
     _libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     _pidinfo = _libproc.proc_pidinfo
     _pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
     _pidinfo.restype = ctypes.c_int
+    _listallpids = _libproc.proc_listallpids
+    _listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _listallpids.restype = ctypes.c_int
 
 
 def _validate_pid(pid: int) -> None:
@@ -96,6 +100,61 @@ def process_identity(pid: int) -> ProcessIdentity | None:
         except (OSError, ValueError, IndexError) as exc:
             raise ProcessProbeError("Cannot confirm process identity") from exc
     raise ProcessProbeError("Only macOS and Linux process probes are supported")
+
+
+def session_process_groups(sid: int) -> set[int]:
+    """Return all confirmed member PGIDs, including groups with an exited leader.
+
+    An empty set means confirmed absence; an incomplete scan raises instead.
+    Callers must establish SID ownership, and stop using it once it disappears:
+    a SID cannot be reused while members remain, but can be reused afterwards.
+    """
+    _validate_pid(sid)
+    groups = set()
+    try:
+        if sys.platform == "darwin":
+            if _listallpids is None:
+                raise ProcessProbeError("Native process enumeration is unavailable")
+            for _ in range(3):
+                count = _listallpids(None, 0)
+                if count <= 0:
+                    raise ProcessProbeError("Cannot size the native process list")
+                pids = (ctypes.c_int * (count + 64))()
+                count = _listallpids(pids, ctypes.sizeof(pids))
+                if 0 < count < len(pids):
+                    break
+            else:
+                raise ProcessProbeError("Cannot obtain a complete native process list")
+            for pid in pids[:count]:
+                if pid <= 0:
+                    continue
+                try:
+                    if os.getsid(pid) == sid:
+                        pgid = os.getpgid(pid)
+                        # Recheck after getpgid to reject a PID-reuse race.
+                        if pgid > 0 and os.getsid(pid) == sid:
+                            groups.add(pgid)
+                except ProcessLookupError:
+                    continue
+        elif sys.platform.startswith("linux"):
+            for path in _PROC.iterdir():
+                if not path.name.isdecimal():
+                    continue
+                try:
+                    raw = (path / "stat").read_text()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                # comm may contain spaces and parentheses; fields after its last
+                # ')' start with state, ppid, pgrp, session (stat fields 3..6).
+                fields = raw[raw.rindex(")") + 1:].split()
+                pgid, observed_sid = int(fields[2]), int(fields[3])
+                if observed_sid == sid and pgid > 0:
+                    groups.add(pgid)
+        else:
+            raise ProcessProbeError("Only macOS and Linux process probes are supported")
+    except (OSError, ValueError, IndexError) as exc:
+        raise ProcessProbeError("Cannot confirm all session process groups") from exc
+    return groups
 
 
 def process_rss(pid: int) -> int | None:

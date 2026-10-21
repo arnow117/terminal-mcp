@@ -13,7 +13,7 @@ import time
 from typing import Any, Iterable, Mapping
 
 from .contracts import STATUSES
-from .procinfo import ProcessProbeError, process_identity
+from .procinfo import ProcessProbeError, process_identity, session_process_groups
 
 
 def _pid(value: Any) -> bool:
@@ -142,37 +142,53 @@ class Registry:
 
     @staticmethod
     async def _stop_record(record: RegistryRecord, grace_ms: int) -> None:
-        def group_exists():
-            try:
-                os.killpg(record.pgid, 0)
-                return True
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                # Exiting macOS groups may briefly reject even signal-zero probes.
-                # Unknown is not gone: keep waiting, and retain the file on timeout.
-                return True
+        leader = process_identity(record.leader_pid)
+        if (leader is None or record.pgid != record.leader_pid
+                or not record_matches_process(record, leader.pid, leader.pgid, leader.start_time)):
+            # A missing leader at restart gives no trustworthy SID generation.
+            # Never rediscover ownership by SID alone, even if members still exist.
+            raise ProcessProbeError("Cannot confirm the recorded session leader")
 
-        def send(sig):
-            # Recheck immediately before every nonzero signal, including escalation.
+        def members():
             leader = process_identity(record.leader_pid)
-            if leader is None or not record_matches_process(record, leader.pid, leader.pgid, leader.start_time):
-                if group_exists():
-                    raise ProcessProbeError("Cannot confirm the remaining process group's leader")
-                return
-            try:
-                os.killpg(record.pgid, sig)
-            except ProcessLookupError:
-                pass
+            if leader is not None and not record_matches_process(record, leader.pid, leader.pgid, leader.start_time):
+                raise ProcessProbeError("The recorded session leader identity changed")
+            # Once matched, continuous nonempty membership keeps this SID reserved
+            # even if TERM kills the leader. Stop immediately on the first empty scan
+            # so a later reused PID/SID can never become a new signaling target.
+            return session_process_groups(record.leader_pid)
 
-        send(signal.SIGTERM)
+        def send(groups, sig):
+            sent = set()
+            for pgid in groups:
+                try:
+                    os.killpg(pgid, sig)
+                    sent.add(pgid)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # Unknown is not gone: retry only freshly confirmed members,
+                    # and retain the registry file if the bounded cleanup fails.
+                    pass
+            return sent
+
+        groups = members()
+        sent = send(groups, signal.SIGTERM)
         deadline = asyncio.get_running_loop().time() + grace_ms / 1000
-        while group_exists() and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(.01)
-        if group_exists():
-            send(signal.SIGKILL)
-        deadline = asyncio.get_running_loop().time() + 1
-        while group_exists():
+        while groups:
             if asyncio.get_running_loop().time() >= deadline:
-                raise ProcessProbeError("The stale process group has not disappeared")
+                break
+            await asyncio.sleep(.01)
+            groups = members()
+            sent.update(send(groups - sent, signal.SIGTERM))
+        deadline = asyncio.get_running_loop().time() + 1
+        killed = set()
+        while groups:
+            # Refresh membership immediately before escalation as well.
+            groups = members()
+            if not groups:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ProcessProbeError("The stale session has not disappeared")
+            killed.update(send(groups - killed, signal.SIGKILL))
             await asyncio.sleep(.01)

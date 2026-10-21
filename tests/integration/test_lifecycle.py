@@ -274,3 +274,254 @@ async def test_stdio_two_second_timeout(tmp_path):
         result = await server.call("terminal_read", {"session_id": started["session_id"], "cursor": started["next_cursor"], "wait_ms": 4000, "until": "(?!)"})
         assert result["status"] == "timed_out"
         await gone(pids, time.monotonic() + 2)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+async def test_kill_waits_for_pending_spawn(manager, monkeypatch, remove):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = manager._spawn
+
+    async def delayed(session, prepared):
+        entered.set()
+        await release.wait()
+        await original(session, prepared)
+
+    monkeypatch.setattr(manager, "_spawn", delayed)
+    starter = asyncio.create_task(manager.start(command="exec sleep 60", mode="pipe"))
+    killer = None
+    try:
+        await entered.wait()
+        session, = manager.sessions.values()
+        killer = asyncio.create_task(manager.kill(session.session_id, remove=remove))
+        await asyncio.sleep(.03)
+        assert not killer.done(), "Kill must wait for spawn before final cleanup"
+        release.set()
+        started, killed = await asyncio.gather(starter, killer)
+        assert killed["status"] != "running"
+        assert killed["removed"] == remove
+        await assert_pids_gone([started["pid"]], time.monotonic() + 2)
+        assert (session.session_id not in manager.sessions) == remove
+    finally:
+        release.set()
+        await asyncio.gather(starter, *([killer] if killer else []), return_exceptions=True)
+        # Independent fallback cleanup makes RED runs safe even with broken ownership.
+        if session.pid is not None:
+            try:
+                os.kill(session.pid, 9)
+            except ProcessLookupError:
+                pass
+            await assert_pids_gone([session.pid], time.monotonic() + 2)
+
+
+async def test_list_hides_pending_spawn(manager, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = manager._spawn
+
+    async def delayed(session, prepared):
+        entered.set()
+        await release.wait()
+        await original(session, prepared)
+
+    monkeypatch.setattr(manager, "_spawn", delayed)
+    starter = asyncio.create_task(manager.start(command="exec sleep 60", mode="pipe"))
+    try:
+        await entered.wait()
+        assert (await manager.list())["count"] == 0
+        session, = manager.sessions.values()
+        with pytest.raises(ToolError) as error:
+            await manager.list(session.session_id)
+        assert error.value.code == "SESSION_NOT_FOUND"
+    finally:
+        release.set()
+        await starter
+
+
+@pytest.mark.parametrize("phase", ["before_spawn", "after_spawn", "initial_read"])
+async def test_cancelled_start_reaps_and_removes_session(manager, monkeypatch, phase):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = manager._spawn
+
+    async def delayed(session, prepared):
+        if phase != "before_spawn":
+            await original(session, prepared)
+        entered.set()
+        await release.wait()
+        if phase == "before_spawn":
+            await original(session, prepared)
+
+    if phase != "initial_read":
+        monkeypatch.setattr(manager, "_spawn", delayed)
+    starter = asyncio.create_task(manager.start(command="exec sleep 60", mode="pipe", wait_ms=10000))
+    try:
+        if phase == "initial_read":
+            with anyio.fail_after(2):
+                while not manager.sessions or not next(iter(manager.sessions.values())).spawn_task.done():
+                    await asyncio.sleep(.01)
+        else:
+            await entered.wait()
+        session, = manager.sessions.values()
+        starter.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await starter
+        await session.spawn_task
+        await assert_pids_gone([session.pid], time.monotonic() + 2)
+        assert session.session_id not in manager.sessions
+    finally:
+        release.set()
+        await asyncio.gather(starter, return_exceptions=True)
+
+
+@pytest.mark.parametrize("action", ["kill", "eof", "timeout"])
+@pytest.mark.parametrize("jobs", [1, 3])
+async def test_stdio_interactive_job_groups_are_all_reaped(tmp_path, action, jobs):
+    import re
+    from test_restart import connection, gone
+
+    pids = []
+    try:
+        async with connection(tmp_path, config_text="kill_grace_ms = 100\n") as server:
+            started = await server.call("terminal_start", {
+                "command": 'PS1="P> " exec /bin/bash --noprofile --norc -i',
+                "mode": "pty", "timeout_s": 2 if action == "timeout" else 60,
+                "wait_ms": 2000, "until": "P> ",
+            })
+            pids.append(started["pid"])
+            await server.call("terminal_write", {
+                "session_id": started["session_id"], "text": "set +H",
+                "keys": ["Enter"], "wait_ms": 1000, "until": "P> ",
+            })
+            background = "; ".join("sleep 60 & echo BG:$!" for _ in range(jobs))
+            foreground = python_command("import os,time; print('FG:'+str(os.getpid()),flush=True); time.sleep(60)")
+            # Do not exec the foreground job in the interactive shell.
+            foreground = foreground.removeprefix("exec ")
+            page = await server.call("terminal_write", {
+                "session_id": started["session_id"], "text": background + "; " + foreground,
+                "keys": ["Enter"], "wait_ms": 2000, "until": r"FG:\d+",
+            })
+            pids.extend(int(pid) for pid in re.findall(r"(?:BG|FG):(\d+)", page["output"]))
+            assert len(pids) == jobs + 2, page["output"]
+            assert len({os.getpgid(pid) for pid in pids}) == jobs + 2
+            assert all(os.getsid(pid) == started["pid"] for pid in pids)
+            before = time.monotonic()
+            if action == "kill":
+                killed = await server.call("terminal_kill", {"session_id": started["session_id"], "grace_ms": 100})
+                assert killed["status"] != "running"
+            elif action == "eof":
+                await server.process.stdin.aclose()
+                with anyio.fail_after(2):
+                    assert await server.process.wait() == 0
+            else:
+                page = await server.call("terminal_read", {
+                    "session_id": started["session_id"], "cursor": page["next_cursor"],
+                    "wait_ms": 4000, "until": "(?!)",
+                })
+                assert page["status"] == "timed_out"
+                before = time.monotonic()
+            await gone(pids, before + 2)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        await assert_pids_gone(pids, time.monotonic() + 2)
+
+
+@pytest.mark.parametrize("mode", ["pty", "pipe"])
+async def test_stdio_term_ignoring_process_escalates(tmp_path, mode):
+    from test_restart import connection, gone
+
+    async with connection(tmp_path) as server:
+        started = await server.call("terminal_start", {
+            "command": python_command("import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); time.sleep(60)"),
+            "mode": mode, "wait_ms": 2000, "until": "ready",
+        })
+        before = time.monotonic()
+        killed = await server.call("terminal_kill", {"session_id": started["session_id"], "grace_ms": 500})
+        assert killed["status"] == "signaled"
+        assert killed["signal"] == "SIGKILL" and killed["escalated"]
+        assert time.monotonic() - before >= .49
+        await gone([started["pid"]], before + 2)
+
+
+@pytest.mark.parametrize("action", ["shutdown", "watchdog", "cancel_kill"])
+async def test_cleanup_coordinates_with_spawn_barrier(manager, monkeypatch, action):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = manager._spawn
+
+    async def delayed(session, prepared):
+        if action == "watchdog":
+            await original(session, prepared)
+        entered.set()
+        await release.wait()
+        if action != "watchdog":
+            await original(session, prepared)
+
+    monkeypatch.setattr(manager, "_spawn", delayed)
+    starter = asyncio.create_task(manager.start(command="exec sleep 60", mode="pipe", timeout_s=1))
+    cleanup = None
+    try:
+        await entered.wait()
+        session, = manager.sessions.values()
+        if action == "shutdown":
+            cleanup = asyncio.create_task(manager.shutdown_all())
+        elif action == "cancel_kill":
+            cleanup = asyncio.create_task(manager.kill(session.session_id))
+            await asyncio.sleep(.02)
+            cleanup.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cleanup
+        else:
+            await asyncio.sleep(1.05)
+            assert session.termination_task is not None and not session.termination_task.done()
+        assert not session.group_cleaned
+        release.set()
+        started = await starter
+        if cleanup is not None:
+            await asyncio.gather(cleanup, return_exceptions=True)
+        await assert_pids_gone([started["pid"]], time.monotonic() + 2)
+        with anyio.fail_after(2):
+            await asyncio.shield(session.termination_task)
+        if action == "watchdog":
+            assert session.status == "timed_out"
+        assert session.group_cleaned
+    finally:
+        release.set()
+        await asyncio.gather(starter, *([cleanup] if cleanup else []), return_exceptions=True)
+
+
+async def test_unknown_membership_keeps_ownership_until_retry(manager, monkeypatch):
+    from terminal_mcp.procinfo import ProcessProbeError
+
+    started = await manager.start(command="exec sleep 60", mode="pipe")
+    session = manager.sessions[started["session_id"]]
+    with monkeypatch.context() as scoped:
+        def unknown(sid):
+            raise ProcessProbeError("Synthetic incomplete membership scan")
+
+        scoped.setattr(session_module, "session_process_groups", unknown)
+        scoped.setattr(session_module.os, "killpg", lambda *args: pytest.fail("Unknown groups must not be signaled"))
+        with pytest.raises(ProcessProbeError):
+            await manager.kill(session.session_id, remove=True)
+        assert not session.group_cleaned
+        assert session.session_id in manager.sessions
+        os.kill(session.pid, 0)
+    killed = await manager.kill(session.session_id, remove=True)
+    assert killed["status"] == "signaled"
+    await assert_pids_gone([session.pid], time.monotonic() + 2)
+
+
+async def test_parent_side_spawn_failure_reaps_without_self_deadlock(manager, monkeypatch):
+    def fail(fd, blocking):
+        raise OSError("Synthetic PTY parent setup failure")
+
+    monkeypatch.setattr(session_module.os, "set_blocking", fail)
+    with anyio.fail_after(2):
+        with pytest.raises(ToolError) as error:
+            await manager.start(command="exec sleep 60", mode="pty")
+    assert error.value.code == "START_FAILED"
+    session, = manager.sessions.values()
+    assert session.status == "failed_to_start" and session.group_cleaned
+    assert session.reaper_task.done()
+    await assert_pids_gone([session.pid], time.monotonic() + 2)

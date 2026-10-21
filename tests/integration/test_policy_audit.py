@@ -172,3 +172,63 @@ async def test_audit_failure_does_not_block_owned_process_cleanup(config, monkey
     finally:
         monkeypatch.undo()
         await manager.shutdown_all()
+
+
+async def test_existing_audit_permissions_are_tightened(tmp_path):
+    import os
+
+    state = tmp_path / "state"
+    state.mkdir()
+    path = state / "audit.jsonl"
+    path.touch()
+    path.chmod(0o644)
+    async with connection(tmp_path, state=state) as server:
+        await server.call("terminal_list")
+        assert os.stat(path).st_mode & 0o7777 == 0o600
+
+
+@pytest.mark.parametrize("kind", ["symlink", "foreign_owner", "non_regular"])
+async def test_unsafe_audit_file_fails_closed(config, monkeypatch, kind):
+    import os
+    import stat
+    import terminal_mcp.audit as module
+
+    manager = SessionManager(config)
+    reader = None
+    try:
+        await manager.initialize()
+        path = manager.audit.path
+        if kind == "symlink":
+            target = config.state_dir / "target"
+            target.write_text("unchanged")
+            path.symlink_to(target)
+        elif kind == "non_regular":
+            os.mkfifo(path)
+            reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        else:
+            path.touch()
+            original = os.fstat
+
+            def foreign(fd):
+                info = original(fd)
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=os.getuid() + 1)
+
+            monkeypatch.setattr(module.os, "fstat", foreign)
+        context = SimpleNamespace(lifespan_context=AppContext(manager))
+        result = await on_call_tool(context, types.CallToolRequestParams(
+            name="terminal_start", arguments={"command": "exec sleep 60"},
+        ))
+        assert result.is_error and result.structured_content["error"]["code"] == "INTERNAL_ERROR"
+        assert manager.sessions == {}
+        if kind == "symlink":
+            assert target.read_text() == "unchanged"
+        monkeypatch.undo()
+        path.unlink()
+        with pytest.raises(ToolError) as error:
+            await manager.start(command="exec sleep 60")
+        assert error.value.code == "INTERNAL_ERROR"
+    finally:
+        monkeypatch.undo()
+        if reader is not None:
+            os.close(reader)
+        await manager.shutdown_all()
