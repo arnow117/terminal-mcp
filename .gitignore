@@ -1,0 +1,15 @@
+# Local working files (scripts, caches, logs, scratch)
+.work/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
+# Runtime state written by the server during local runs
+*.audit.jsonl
