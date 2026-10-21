@@ -63,8 +63,8 @@ session.py: SessionManager ─── registry.py
 
 ##### `buffer.py`：有界原始字节输出缓冲
 
-- **职责**：保存带 `stream`（`pty`/`stdout`/`stderr`）标签的原始字节区段和单调递增绝对偏移；按 1 MiB 上限逐段淘汰；从游标产生 UTF-8 安全文本、`dropped_bytes`、`next_cursor`、`has_more`，并通知长轮询者。
-- **接口**：`append(stream, bytes)`、`read(cursor, max_bytes, strip_ansi)`、`wait_for_change_or_exit(...)`。
+- **职责**：保存带 `stream`（`pty`/`stdout`/`stderr`）标签的原始字节区段和单调递增绝对偏移；按 1 MiB 上限逐段淘汰；从游标产生 UTF-8 安全文本、`dropped_bytes`、`next_cursor`、`has_more`。纯缓冲不拥有异步任务；T02 的 `Session` 在 append/close 后通知自己的长轮询条件。
+- **接口**：`OutputBuffer(capacity_bytes=1048576, mode="pty")`、`append(stream, bytes)`、`read(cursor, max_bytes=65536, strip_ansi=True) -> OutputPage`、`close_stream(stream)`；`OutputPage` 是不可变 dataclass，含 `output/stdout/stderr/next_cursor/dropped_bytes/has_more`。等待和退出状态由会话层组合。
 - **覆盖**：`REQ-F02`、`REQ-F04`、`REQ-F06`。
 
 ##### PTY/pipe 后端（`session.py` 内的两个小启动路径）
@@ -88,7 +88,7 @@ session.py: SessionManager ─── registry.py
 ##### `audit.py` 与 `registry.py`：可审计生命周期
 
 - **职责**：追加 JSONL 审计而不记录输出正文；原子保存最少的会话注册表；启动时安全清扫上一进程遗留组并标记旧记录 `lost`。
-- **接口**：`Audit.log(event)`、`Registry.load/snapshot/write/sweep_records`。
+- **接口**：T01 提供 `Audit(path).log(event)`、`Registry(state_dir, owner_pid, owner_lstart, instance_id).load/snapshot/write`、不可变 `RegistryRecord` 与纯比较函数 `owner_is_live` / `record_matches_process`；PID/lstart 采集、`flock`、扫描和实际发信号仅由 T04 接线。探测失败不等同于 owner 不存在，T04 必须保守跳过无法确认的文件。
 - **覆盖**：`REQ-F04`、`REQ-F05`、`REQ-F08`。
 
 ##### 建议包布局
@@ -269,7 +269,7 @@ src/terminal_mcp/
 | `grace_ms` | `integer`，默认 `1,000` | 0 至 30,000；`KILL` 时忽略并立即 SIGKILL；其余信号到期后升级 SIGKILL。 |
 | `remove` | `boolean`，默认 `false` | `true` 仅在整组 reaped 后删除内存/注册表记录。 |
 
-成功 `structuredContent` 为：`session_id`、`status`、`exit_code`、`signal`、`termination_reason`（`manual`、`timeout`、`shutdown`）、`escalated:boolean`、`removed:boolean`、`ended_at`。`status` 为 `exited`（程序自行正常退出）、`signaled`（最终被信号终止）或 `timed_out`（硬超时路径）；状态为 `exited` 的既有会话会有 `escalated=false`。
+成功 `structuredContent` 为：`session_id`、`status`、`exit_code`、`signal`、`termination_reason`（`manual`、`timeout`、`shutdown`）、`escalated:boolean`、`removed:boolean`、`ended_at`。`status` 为 `exited`（程序自行正常退出）、`signaled`（最终被信号终止）、`timed_out`（硬超时路径）或已保留的 `failed_to_start`。后者没有可终止的进程，只幂等返回原状态，`escalated=false`，`remove=true` 可移除失败记录；这是通用终态幂等约定的明确化，不把失败启动误报为正常退出。状态为 `exited` 的既有会话也有 `escalated=false`；`running` 和 `lost` 不属于 kill 成功分支。
 
 #### 时序与数据流
 
@@ -283,8 +283,8 @@ src/terminal_mcp/
 
 - **绝对游标**：每次后端读取到原始 byte 都分配连续的会话内 `[start,end)` 偏移。`cursor` 是绝对偏移，`next_cursor` 是本次成功返回的最后一个完整 UTF-8 字符之后的原始偏移，不能把显示字符串长度当作 cursor。
 - **淘汰**：容量为 1 MiB。若 `cursor < output_start_cursor`，从当前最早保留字节开始读，`dropped_bytes=output_start_cursor-cursor`；它只计被环淘汰的原始字节，绝不把 ANSI 去除字节计入。`has_more` 表示 `next_cursor < output_end_cursor`。
-- **编码**：缓冲永远存原始 bytes。读窗口在 UTF-8 字符边界截断；不足一个有效字节序列的尾部留给下一次，避免拆分多字节字符。非法序列用 U+FFFD 替换，并继续处理后续字节。pipe 的 stdout/stderr 按各自流的字节顺序独立增量解码，保持同一个全局 cursor；最后未完成字符所属流不推进 cursor。`max_bytes` 最小为 4，保证完整 UTF-8 字符可前进。
-- **ANSI**：默认在解码后跨 chunk 去除 ANSI CSI/OSC 序列，并把 PTY 的 `\r\n` 规范为 `\n`；`strip_ansi=false` 才显示原序列与原换行。匹配 `until` 使用未去除 ANSI 的解码文本，避免展示选项改变控制语义；`until` 只在本次调用起始游标之后、且不超过缓冲保留范围的文本上增量匹配，避免海量输出时重复全量扫描。
+- **编码**：缓冲永远存原始 bytes。读窗口在 UTF-8 字符边界截断；不足一个有效字节序列的尾部留给下一次，避免拆分多字节字符。非法序列用 U+FFFD 替换，并继续处理后续字节。pipe 的 stdout/stderr 按各自流的字节顺序独立增量解码，保持同一个全局 cursor；读窗口回退到对所有流都安全的公共边界，不返回该边界之后的其他流正文以免重复。`max_bytes` 最小为 4，足够容纳一个连续 UTF-8 字符；跨流交错字符尚未完成或超出本次全局窗口时仍须等待/扩大读取窗口。后端 EOF 必须调用 `close_stream`，将该流最后不完整序列输出为 U+FFFD。
+- **ANSI**：默认在解码后跨 chunk/分页去除 ANSI CSI/OSC 序列，并把 `\r\n` 规范为 `\n`；stripped 模式暂缓消费未关闭流末尾的单独 CR，直到后续字符或 EOF，以保证跨页 CRLF 正确且不折叠其他 CR。`strip_ansi=false` 才显示原序列与原换行。只保存淘汰起点的有限 ANSI 解析状态，不保留 OSC 正文；从同一 cursor 重读不改变其他读取者的结果。原始段按最多 8 KiB 合并，大 append 的已淘汰前缀同样分块处理，不分配与总输出量同大的临时副本。匹配 `until` 使用未去除 ANSI 的解码文本，避免展示选项改变控制语义；`until` 只在本次调用起始游标之后、且不超过缓冲保留范围的文本上增量匹配，避免海量输出时重复全量扫描。
 - **PTY 回显**：PTY 模式下终端会回显写入内容，因此 `terminal_write` 返回的输出包含输入本身；这是终端语义，需在 Tool 描述中说明。
 - **pipe 模式**：stdout、stderr 的每个块在到达时写进同一时间序缓冲并有 stream 标签；结果不合成为不可区分的 `output`，而返回 `stdout` 和 `stderr`。两个值之间的跨流显示先后以后台 reader 实际到达顺序为准，不伪造严格 OS 时间顺序。
 - **进程模型**：PTY 的 `pty.fork()` 令子进程成为新 session/进程组 leader 并拥有 controlling TTY，环境加 `TERM=xterm-256color`；pipe 的 `start_new_session=True` 令 leader PID=PGID。命令用 `/bin/sh -c`，默认 shell 用 `$SHELL -l`。fork 后的子进程只做 `TIOCSWINSZ`/`chdir`/`execvpe`，失败时 `os._exit(127)`，不执行其他 Python 逻辑（服务进程可能有 AnyIO 工作线程）。所有 PTY FD 设为 nonblocking，pipe 由独立 drain task 持续消费，避免高输出反压死锁。
@@ -310,15 +310,15 @@ max_timeout_s = 86400
 kill_grace_ms = 1000
 exit_retention_s = 600
 
-# 用户可在不放宽其他默认限制的前提下替换或追加规则
+# User rules only add restrictions; built-in rules remain enabled.
 [[dangerous_command_rules]]
 id = "rm-root"
 pattern = "rm\\s+[^\\n]*-rf[^\\n]*\\s/(?:\\s|$)"
 ```
 
 - **cwd**：配置的每个 root 和请求 cwd 都先 `Path.resolve(strict=True)`；以 `os.path.commonpath([cwd, root]) == root` 判断包含关系，拒绝符号链接逃逸、相对路径转义、不存在路径和非目录。
-- **环境**：继承环境先按不区分大小写的 glob denylist 剥离，再叠加调用 `env`，最后再次剥离。调用方显式提供命中敏感模式的键会得到 `POLICY_DENIED`，不会静默注入。只保留值不含 NUL、键合法、总量受限的环境。
-- **命令**：启动命令和写入的每个完整逻辑行都按预编译规则检查；默认规则 ID 覆盖 `rm -rf /`、`mkfs`、`dd ... of=/dev/...`、`shutdown`/`reboot`/`halt`/`poweroff`、经典 fork bomb、`curl|sh`/`wget|sh`。`terminal_write` 维护每会话的未完成行：跨调用拼接后才检查；`Enter` 会检查当前未完成行且规则命中时不发送 Enter。一次 write 内任一完整行被拒绝时，整个 write 原子拒绝，避免前一行已执行而后一行失败。
+- **环境**：继承环境先按不区分大小写的 glob denylist 剥离，再叠加调用 `env`，最后再次剥离。调用方显式提供命中敏感模式的键会得到 `POLICY_DENIED`，不会静默注入。只保留值不含 NUL、键合法、总量受限的环境。TOML `env_deny_patterns` 与内置模式取并集，危险命令自定义规则也只追加，不允许借空列表/替换规则删除默认保护；这落实“本地配置只能收紧”的默认边界。
+- **命令**：启动命令和写入的每个完整逻辑行都按预编译规则检查；默认规则 ID 为 `rm-root`、`mkfs`、`dd-device`、`power-control`、`fork-bomb`、`download-shell`，分别覆盖 `rm -rf /`、`mkfs`、`dd ... of=/dev/...`、`shutdown`/`reboot`/`halt`/`poweroff`、经典 fork bomb、`curl|sh`/`wget|sh`。`terminal_write` 维护每会话的未完成行：跨调用拼接后才检查；CRLF 视为一次提交，Backspace 删除一个字符，C-c 清空待提交行；Enter 会检查当前未完成行且规则命中时不发送 Enter。一次 write 内任一完整行被拒绝时，整个 write 原子拒绝且 tracker 不变，避免前一行已执行而后一行失败。未提交输入最多 65,536 UTF-8 字节（`input-line-limit`）；tracker 与实际写操作须受同一会话写锁保护，写失败由 T02 停止继续写或恢复到实际送出的状态；不模拟箭头键/交互编辑器。
 - **审计**：审计文件为 state 目录下 `audit.jsonl`，每次 Tool 调用和策略判定追加一行，字段为 `timestamp`、`tool`、`session_id`、`command`（start 命令或被检查的完整 write 行；其他 Tool 为 `null`）、`cwd`、`mode`、`parameter_summary`、`policy:{decision,rule_id}`、`result:{status,exit_code,signal,error_code}`、`duration_ms`。不写 `output`、`stdout`、`stderr` 或环境变量值。审计文件本身可能包含命令文本，必须按本机敏感日志保护，不能提交到 Git。
 - **诚实限制**：这是防 Agent 误操作和意外泄密的 best-effort guardrail，不是 OS sandbox，也不能防止当前用户、shell 转义/编码、已允许程序的二次下载、交互式编辑器动作或故意规避规则。服务以当前用户权限执行；MVP 不实施 elicitation 审批，命中规则一律拒绝。
 
@@ -492,7 +492,7 @@ UV_CACHE_DIR=.work/uv-cache uv run terminal-mcp --help
 ##### 阶段 1：准备
 
 1. **FEAT-001-T01 — 建立受测的包契约、配置和纯组件**
-   - **代码范围**：`pyproject.toml`、`uv.lock`、`src/terminal_mcp/__init__.py`、`src/terminal_mcp/__main__.py`、`src/terminal_mcp/contracts.py`、`src/terminal_mcp/config.py`、`src/terminal_mcp/buffer.py`、`src/terminal_mcp/keys.py`、`src/terminal_mcp/policy.py`、`src/terminal_mcp/audit.py`、`src/terminal_mcp/registry.py`、`tests/unit/test_buffer.py`、`tests/unit/test_keys.py`、`tests/unit/test_policy.py`、`tests/unit/test_contracts.py`、`tests/conftest.py`。
+   - **代码范围**：`pyproject.toml`、`uv.lock`、`src/terminal_mcp/__init__.py`、`src/terminal_mcp/__main__.py`、`src/terminal_mcp/contracts.py`、`src/terminal_mcp/config.py`、`src/terminal_mcp/buffer.py`、`src/terminal_mcp/keys.py`、`src/terminal_mcp/policy.py`、`src/terminal_mcp/audit.py`、`src/terminal_mcp/registry.py`、`tests/unit/test_buffer.py`、`tests/unit/test_keys.py`、`tests/unit/test_policy.py`、`tests/unit/test_contracts.py`、`tests/unit/test_audit_registry.py`、`tests/conftest.py`。
    - **依赖**：无。
    - **完成条件**：锁定 Python 3.12、`mcp==2.3.0` 和 pytest；五 Tool 的 input/成功/错误 schema、稳定码、平台路径/TOML 默认、1 MiB 原始字节环、UTF-8/ANSI 规则、键映射、cwd/env/完整行规则和 JSONL/注册表原子写入均有通过的最小实现。
    - **验证**：先令上述单元测试因模块缺失/期望不符失败，再执行 `UV_CACHE_DIR=.work/uv-cache uv run pytest -q tests/unit` 通过。
@@ -551,8 +551,7 @@ Manus 使用本机 MCP/自定义 MCP 的上述 command form；Claude Code 使用
 
 ## 实现记录（实际）
 
-- **状态**：尚未执行：等待主 Agent 接受工程上下文、登记 Feature/Task，并派遣单一实现子 Agent。
-- **实际改动与 Task 引用**：`none`；规划阶段仅新增本工程上下文。
+- **FEAT-001-T01（实现完成，待主 Agent 验收）**：审阅并修正既有包/config/contracts/keys/policy 草稿，完成 `buffer.py`、`audit.py`、`registry.py`、`uv.lock` 和五个 `tests/unit/test_*.py`；五 Tool 联合 schema/稳定错误、默认路径/CLI/TOML、原始字节环/跨流 UTF-8/ANSI/CRLF、命名键、cwd/env/完整行策略、单次 O_APPEND JSONL 和按实例原子快照均有纯组件测试。保留 `terminal_kill` 对 `failed_to_start` 的幂等成功，相关契约已统一。历史首次 RED 为缺包 4 个收集错误（exit 2），随后依赖缓存不足导致受阻；主 Agent 补齐缓存和环境后，本次完全离线恢复，先运行 `uv run --offline pytest -q tests/unit` 再现缺 buffer/audit 的 3 个收集错误（exit 2），新增回归又分别证实 denylist 被替换/CRLF 重复提交（2 failed）、大 append 复制前缀/regex OverflowError（2 failed）和 TOML regex OverflowError（1 failed）。修复/重构后，设置 `UV_CACHE_DIR=.work/uv-cache UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1` 执行 `uv run --offline pytest -q tests/unit` 得 **117 passed**（exit 0）；`uv run --offline terminal-mcp --help` 和 `uv lock --locked --offline` 均 exit 0（37 packages）。中途 stdlib tracemalloc 尝试在仓库外生成 pyc 被策略拒绝，后续禁用 bytecode 写入，不申请额外权限。测试隔离 HOME/XDG/config/state，单测 15 秒上限；无实际进程信号、无网络、无新增依赖、未修改 lifecycle state。服务运行保留 T03 stub，异步会话/实际 sweep/README 分别留给 T02/T04/T05，当前证据不声称完成真实 MCP 或完整 US1–US8 验收。
 
 ## 验证记录（实际）
 
